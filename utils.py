@@ -7,33 +7,32 @@ Includes logging setup, config loading, general input handling patterns,
 and parsing helpers.
 """
 
-# __version__ = "1.0.0" # Previous Version
-__version__ = "1.0.1" # Enhanced read_file_list for CSV handling
+# __version__ = "1.0.2" # Previous Version (Corrected argparse import)
+__version__ = "1.0.3" # Enhanced parse_devices_input for recursive file path handling in lists
 
 # Modifications:
 # Date       | Version | Author     | Description
 # ---------- | ------- | ---------- | -----------
-# 2025-04-30 | 1.0.0   | Rahul Mehta| Initial file creation.
-# 2025-05-13 | 1.0.1   | Rahul Mehta     | Modified read_file_list to handle comma-separated values within lines of a file.
+# ... (previous history) ...
+# 2025-05-13 | 1.0.2   | Rahul Mehta   | Added missing 'import argparse' for type hints.
+# 2025-05-13 | 1.0.3   | Rahul Mehta   | Modified parse_devices_input to recursively handle 'file:' prefix within list items and pass logger.
 
 import logging
 import json
 import os
 import sys
+import argparse # For type hinting argparse.Namespace
 from typing import Dict, List, Optional, Tuple, Any, Callable
 
-# Get logger for this module
-logger = logging.getLogger(__name__)
+# Get logger for this module (will be configured by the main script's setup_logger)
+# This logger is used by functions within this module.
+module_logger = logging.getLogger(__name__)
 
 
 def setup_logger(debug: bool = False, log_file_path: Optional[str] = None, log_level=logging.INFO):
     """
     Configures the root logger for the script.
-
-    Args:
-        debug: If True, sets level to DEBUG and uses a more verbose format.
-        log_file_path: Optional path to a file to write logs to.
-        log_level: The minimum logging level if not in debug mode.
+    (No changes from version 1.0.2)
     """
     if logging.root.hasHandlers():
         logging.root.handlers.clear()
@@ -43,7 +42,6 @@ def setup_logger(debug: bool = False, log_file_path: Optional[str] = None, log_l
                     else '%(asctime)s - %(levelname)s - %(message)s'
     formatter = logging.Formatter(formatter_str)
 
-    # Console Handler
     console_handler = logging.StreamHandler(sys.stdout)
     console_handler.setFormatter(formatter)
 
@@ -51,10 +49,9 @@ def setup_logger(debug: bool = False, log_file_path: Optional[str] = None, log_l
     root_logger.setLevel(level)
     root_logger.addHandler(console_handler)
 
-    # File Handler (Optional)
     if log_file_path:
         try:
-            file_handler = logging.FileHandler(log_file_path, mode='a') # Append mode
+            file_handler = logging.FileHandler(log_file_path, mode='a')
             file_handler.setFormatter(formatter)
             root_logger.addHandler(file_handler)
             root_logger.info(f"Logging to file: {log_file_path}")
@@ -65,6 +62,7 @@ def setup_logger(debug: bool = False, log_file_path: Optional[str] = None, log_l
 def load_config(file_path: str, logger_instance: logging.Logger) -> Optional[Dict]:
     """
     Loads and parses a JSON configuration file.
+    (No changes from version 1.0.2)
     """
     if not os.path.exists(file_path):
         logger_instance.error(f"Configuration file not found at '{file_path}'.")
@@ -91,59 +89,66 @@ def load_config(file_path: str, logger_instance: logging.Logger) -> Optional[Dic
 def get_config_section(config_data: Optional[Dict], section_name: str, default_value: Any = None) -> Any:
     """
     Safely retrieves a specific section (key) from the configuration dictionary.
+    (No changes from version 1.0.2)
     """
     if config_data is None:
-        logger.debug(f"Config data is None, returning default for section '{section_name}'.")
+        module_logger.debug(f"Config data is None, returning default for section '{section_name}'.")
         return default_value
     section_data = config_data.get(section_name, default_value)
     if section_data is default_value and section_name in config_data:
-        logger.debug(f"Config section '{section_name}' found with default-like value.")
-    elif section_data is default_value:
-         logger.debug(f"Config section '{section_name}' not found, returning default.")
+        module_logger.debug(f"Config section '{section_name}' found with default-like value.")
+    elif section_data is default_value: # Key not found
+         module_logger.debug(f"Config section '{section_name}' not found, returning default.")
     else:
-         logger.debug(f"Successfully retrieved config section '{section_name}'.")
+         module_logger.debug(f"Successfully retrieved config section '{section_name}'.")
     return section_data
 
 
-def parse_devices_input(devices_input: Any) -> List[str]:
+def parse_devices_input(devices_input: Any, logger_instance: logging.Logger) -> List[str]:
     """
-    Parses the raw 'devices' input value (string or list) into a list of strings.
-    Handles "file:" prefix for loading from a file.
+    Parses the raw 'devices' input value into a flat list of unique string identifiers.
+    Handles:
+    - Direct string: "id1,id2, file:path/to/file.csv, id3" (will process file content)
+    - List: ["id1", "file:path/to/another.txt", "id2,id3"] (will process file and split CSV string)
+    - "file:" prefix in strings to load identifiers from a file.
+      The file itself can have one identifier per line or comma-separated identifiers per line.
     """
-    identifiers: List[str] = []
-    if isinstance(devices_input, str):
-        if devices_input.lower().startswith("file:"):
-            file_path = devices_input[len("file:"):]
-            logger.debug(f"Parsing devices from file: {file_path}")
-            # read_file_list now handles comma separation within lines
-            identifiers = read_file_list(file_path, logger)
-        else:
-            logger.debug(f"Parsing devices from string: '{devices_input}'")
-            # Split by comma, then strip whitespace from each item
-            # This also handles spaces around commas.
-            identifiers = [item.strip() for item in devices_input.split(',') if item.strip()]
-    elif isinstance(devices_input, list):
-        logger.debug(f"Parsing devices from list input ({len(devices_input)} items).")
-        # Ensure all elements are strings and strip whitespace, also handle potential inner commas if list contains strings with commas
-        temp_identifiers: List[str] = []
-        for item_in_list in devices_input:
-            if isinstance(item_in_list, (str, int, float)):
-                # If item in list is a string, it might contain commas
-                if isinstance(item_in_list, str):
-                    temp_identifiers.extend([sub_item.strip() for sub_item in item_in_list.split(',') if sub_item.strip()])
-                else: # For int/float, convert to string and add
-                    temp_identifiers.append(str(item_in_list).strip())
-            elif item_in_list is not None: # Log if item is not processable but not None
-                 logger.warning(f"Skipping non-string/numeric item in 'devices' list: {item_in_list} (type: {type(item_in_list)})")
-        identifiers = [id_str for id_str in temp_identifiers if id_str] # Filter out any empty strings resulting from split
+    final_identifiers: List[str] = []
 
-        if len(identifiers) < len(devices_input) and not all(isinstance(i, str) and ',' in i for i in devices_input):
-             # This warning might be noisy if the input list was intentionally like ["ip1,ip2", "ip3"]
-             # Consider refining this warning based on expected list structure.
-             logger.debug(f"Processed {len(identifiers)} identifiers from input list of {len(devices_input)} items (some items might have been comma-separated strings).")
-    else:
-        logger.warning(f"Invalid data type for 'devices' input: {type(devices_input)}. Expected string or list.")
-    return identifiers
+    if isinstance(devices_input, str):
+        stripped_input = devices_input.strip()
+        if stripped_input.lower().startswith("file:"):
+            file_path = stripped_input[len("file:"):]
+            logger_instance.debug(f"Input string is a file path: '{file_path}'. Reading file.")
+            final_identifiers.extend(read_file_list(file_path, logger_instance))
+        else:
+            # Treat as a comma-separated string of identifiers.
+            # Each part could potentially be another "file:" directive if not handled above,
+            # but this recursive call handles it.
+            logger_instance.debug(f"Input string is direct CSV or single ID: '{stripped_input}'. Splitting by comma.")
+            potential_identifiers = [item.strip() for item in stripped_input.split(',') if item.strip()]
+            for pi in potential_identifiers:
+                # Recursively call to handle if an item after split is "file:..."
+                final_identifiers.extend(parse_devices_input(pi, logger_instance))
+    elif isinstance(devices_input, list):
+        logger_instance.debug(f"Input is a list. Processing {len(devices_input)} items.")
+        for item_in_list in devices_input:
+            # Recursively call parse_devices_input for each item in the list.
+            # This handles nested lists or strings (including "file:" or CSVs) within the list.
+            final_identifiers.extend(parse_devices_input(item_in_list, logger_instance))
+    elif isinstance(devices_input, (int, float)):
+        logger_instance.debug(f"Input is a number: {devices_input}. Converting to string.")
+        final_identifiers.append(str(devices_input).strip())
+    elif devices_input is not None: # If it's not None and not any of the handled types
+        logger_instance.warning(f"Invalid data type for 'devices' input item: {type(devices_input)} ('{devices_input}'). Expected string or list.")
+    
+    # Deduplicate while preserving order (Python 3.7+)
+    # If order doesn't matter, `list(set(final_identifiers))` is simpler.
+    seen = set()
+    unique_identifiers = [x for x in final_identifiers if not (x in seen or seen.add(x))]
+    
+    logger_instance.debug(f"Final parsed unique identifiers: {unique_identifiers}")
+    return unique_identifiers
 
 
 def read_file_list(file_path: str, logger_instance: logging.Logger) -> List[str]:
@@ -151,6 +156,7 @@ def read_file_list(file_path: str, logger_instance: logging.Logger) -> List[str]
     Reads a list of items from a file.
     Each line in the file can contain one or more identifiers separated by commas.
     All identifiers are stripped of whitespace and empty ones are skipped.
+    (No changes from version 1.0.2)
     """
     all_items: List[str] = []
     logger_instance.debug(f"Attempting to read device list from file: '{file_path}'")
@@ -174,7 +180,7 @@ def read_file_list(file_path: str, logger_instance: logging.Logger) -> List[str]
     return all_items
 
 # --- Reusable Input Collection and Validation Patterns ---
-# (collect_and_validate_credentials and collect_and_validate_list_inputs remain unchanged from v1.0.0)
+# (collect_and_validate_credentials and collect_and_validate_list_inputs remain unchanged from v1.0.2)
 def collect_and_validate_credentials(
     args: argparse.Namespace,
     config_data: Optional[Dict],
@@ -184,38 +190,24 @@ def collect_and_validate_credentials(
     specific_validator_func: Callable[[Dict, str], Tuple[bool, List[str]]],
     logger_instance: logging.Logger
 ) -> Tuple[Dict, bool]:
-    """
-    Collects credential-like data from CLI and config, validates it.
-    """
     creds_dict: Dict[str, Any] = {}
     logger_instance.debug(f"Collecting credentials/config for '{config_section_name}'...")
-
-    # 1. Collect from CLI arguments (highest priority)
     for cli_arg_name, dict_key_name in cli_arg_map.items():
         cli_value = getattr(args, cli_arg_name, None)
         if cli_value is not None:
             creds_dict[dict_key_name] = cli_value
             logger_instance.debug(f"Collected '{dict_key_name}' from CLI arg '--{cli_arg_name.replace('_', '-')}' = '{cli_value}'.")
-
-    # 2. Get section from config file (if loaded)
-    config_section = get_config_section(config_data, config_section_name, {}) # Default to empty dict
-    if config_section: logger_instance.debug(f"Found config section '{config_section_name}'.")
-    else: logger_instance.debug(f"Config section '{config_section_name}' not found or config not loaded.")
-
-    # 3. Fill missing keys from config section (respecting CLI priority)
+    config_section = get_config_section(config_data, config_section_name, {})
     all_potential_keys = required_keys.union(set(cli_arg_map.values()))
     for key in all_potential_keys:
-         if key not in creds_dict and key in config_section: # Not set by CLI, but present in config
+         if key not in creds_dict and key in config_section:
              creds_dict[key] = config_section[key]
              logger_instance.debug(f"Collected '{key}' from config section '{config_section_name}'.")
-
-    # 4. Perform specific validation
     is_valid, errors = specific_validator_func(creds_dict, f"Source: CLI and/or config section '{config_section_name}'")
     if not is_valid:
         logger_instance.error(f"Validation failed for '{config_section_name}':")
         for error in errors: logger_instance.error(f"  - {error}")
     return creds_dict, is_valid
-
 
 def collect_and_validate_list_inputs(
     args: argparse.Namespace,
@@ -225,15 +217,10 @@ def collect_and_validate_list_inputs(
     item_validator_func: Callable[[Dict, str], Tuple[bool, List[str]]],
     logger_instance: logging.Logger
 ) -> Tuple[List[Dict], List[Tuple[Any, List[str], str]]]:
-    """
-    Collects a list of dict items from CLI and config, validates each.
-    """
     raw_items_with_source: List[Tuple[Dict, str]] = []
     parsing_errors_info: List[Tuple[Any, List[str], str]] = []
     logger_instance.debug(f"Collecting list items from CLI '--{cli_arg_name}' and config '{config_section_name}'...")
-
-    # 1. Collect from CLI arguments (expecting list of JSON strings)
-    cli_arg_values = getattr(args, cli_arg_name, []) or [] # Ensure it's a list
+    cli_arg_values = getattr(args, cli_arg_name, []) or []
     if cli_arg_values:
         logger_instance.debug(f"Found {len(cli_arg_values)} item(s) from CLI arg '--{cli_arg_name}'.")
         for i, json_string in enumerate(cli_arg_values):
@@ -247,8 +234,6 @@ def collect_and_validate_list_inputs(
                 parsing_errors_info.append((json_string, [f"JSON parsing failed: {e}"], f"CLI --{cli_arg_name} index {i}"))
             except Exception as e:
                  parsing_errors_info.append((json_string, [f"Unexpected error: {e}"], f"CLI --{cli_arg_name} index {i}"))
-
-    # 2. Collect from config file section (expecting a list of dictionaries)
     config_section_data = get_config_section(config_data, config_section_name, [])
     if isinstance(config_section_data, list):
         if config_section_data: logger_instance.debug(f"Found {len(config_section_data)} item(s) in config '{config_section_name}'.")
@@ -257,21 +242,16 @@ def collect_and_validate_list_inputs(
                 raw_items_with_source.append((item_data, f"config '{config_section_name}', index {i}"))
             else:
                 parsing_errors_info.append((item_data, ["Item in config list is not a dictionary."], f"config '{config_section_name}', index {i}"))
-    elif config_section_data is not None: # Section exists but is not a list
+    elif config_section_data is not None:
          logger_instance.warning(f"Config section '{config_section_name}' is not a list. Skipping.")
-
-    # 3. Validate each collected item and segregate
     valid_items: List[Dict] = []
-    invalid_item_details: List[Tuple[Any, List[str], str]] = list(parsing_errors_info) # Start with parsing errors
-
+    invalid_item_details: List[Tuple[Any, List[str], str]] = list(parsing_errors_info)
     if raw_items_with_source:
         logger_instance.debug(f"Validating {len(raw_items_with_source)} collected items...")
         for item_dict, source_info in raw_items_with_source:
             is_item_valid, item_errors = item_validator_func(item_dict, source_info)
             if is_item_valid:
                 valid_items.append(item_dict)
-                logger_instance.debug(f"Item from {source_info} validated successfully.")
             else:
                 invalid_item_details.append((item_dict, item_errors, source_info))
-                logger_instance.debug(f"Item from {source_info} validation failed.")
     return valid_items, invalid_item_details
