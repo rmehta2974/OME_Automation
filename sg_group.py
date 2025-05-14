@@ -6,15 +6,15 @@ Main entry point for the OME Static Group Management script.
 Handles argument parsing, orchestrates the workflow, and manages overall script execution.
 """
 
-# __version__ = "1.3.1" # Previous Version
-__version__ = "1.3.2" # Corrected parent group ID lookup for create_static_group
+# __version__ = "1.3.2" # Previous Version
+__version__ = "1.3.3" # Corrected len() call for action='append' CLI arguments.
 
 # Modifications:
 # Date       | Version | Author     | Description
 # ---------- | ------- | ---------- | -----------
 # ...
-# 2025-05-13 | 1.3.1   | Rahul Mehta    | Updated call to utils.parse_devices_input to pass the logger instance.
-# 2025-05-14 | 1.3.2   | Rahul Mehta    | Modified process_group_task to correctly look up and pass the integer ID of the parent group (including default "Static Groups") to ome_client.create_static_group.
+# 2025-05-14 | 1.3.2   | Gemini     | Modified process_group_task to correctly look up and pass the integer ID of the parent group.
+# 2025-05-14 | 1.3.3   | Gemini     | Corrected calculation of total_cli_groups to handle None when action='append' CLI arg is not provided.
 
 import argparse
 import sys
@@ -26,7 +26,7 @@ from typing import Dict, List, Optional, Tuple, Any
 import utils # Ensure this is utils v1.0.4 or later
 import constants # Ensure this is constants_v1_2_0_equiv (internally v1.2.3) or later
 import input_validator
-import ome_client # Ensure this is ome_client v1.10.12 or later
+import ome_client # Ensure this is ome_client v1.10.14 or later
 import concurrent.futures
 
 logger = logging.getLogger(__name__)
@@ -38,7 +38,7 @@ def main():
     parser.add_argument('--password', help='OME Password', metavar='PASSWORD')
     parser.add_argument('--config', help='Path to a JSON configuration file', metavar='FILE_PATH')
     parser.add_argument(
-        f'--{constants.STATIC_GROUP_CLI_ARG_NAME}',
+        f'--{constants.STATIC_GROUP_CLI_ARG_NAME}', # This uses action='append'
         action='append',
         help='JSON string defining a single static group. Can be specified multiple times.',
         metavar='JSON_STRING'
@@ -77,10 +77,17 @@ def main():
         constants.STATIC_GROUP_CONFIG_SECTION,
         input_validator.validate_static_group_definition_specific, logger
     )
-    total_cli_groups = len(getattr(args, constants.STATIC_GROUP_CLI_ARG_NAME, []))
+    
+    # --- CORRECTED Strict Exit Logic ---
+    # getattr will return None if --StaticGroup was not provided, because action='append' sets it to None by default.
+    cli_groups_value = getattr(args, constants.STATIC_GROUP_CLI_ARG_NAME, None)
+    total_cli_groups = len(cli_groups_value) if cli_groups_value is not None else 0
+    
     config_groups_list = utils.get_config_section(config, constants.STATIC_GROUP_CONFIG_SECTION, [])
     total_config_groups = len(config_groups_list) if isinstance(config_groups_list, list) else 0
-    if (total_cli_groups + total_config_groups) == 1 and not valid_raw_groups:
+    total_input_group_items = total_cli_groups + total_config_groups
+
+    if total_input_group_items == 1 and not valid_raw_groups:
         logger.fatal("Only one static group definition provided, and it is invalid. Exiting.")
         sys.exit(1)
     if invalid_group_details:
@@ -134,12 +141,10 @@ def process_group_task(ome_client_instance: ome_client.OmeClient,
     group_id_to_update: Optional[str] = None
     group_existed_beforehand: bool = False
     
-    # Determine the actual Parent ID to use for creation
     parent_id_for_creation: Optional[int] = None
-    # parent_group_name will be DEFAULT_PARENT_GROUP if not specified in input, or the user's value
     parent_group_name_to_find = group_task.get('parent_group_name', constants.DEFAULT_PARENT_GROUP)
 
-    if parent_group_name_to_find: # If a parent name is specified (either default or custom)
+    if parent_group_name_to_find:
         logger.debug(f"Resolving Parent ID for parent group name: '{parent_group_name_to_find}'")
         parent_group_obj = ome_client_instance.get_group_by_name(parent_group_name_to_find)
         if parent_group_obj and parent_group_obj.get('Id') is not None:
@@ -148,17 +153,13 @@ def process_group_task(ome_client_instance: ome_client.OmeClient,
                 logger.info(f"Found parent group '{parent_group_name_to_find}' with ID: {parent_id_for_creation}.")
             except (ValueError, TypeError):
                 logger.error(f"ID '{parent_group_obj['Id']}' for parent group '{parent_group_name_to_find}' is not a valid integer. Cannot create child group '{group_name}'.")
-                return # Critical error, cannot proceed with this task
+                return
         else:
             logger.error(f"Specified parent group '{parent_group_name_to_find}' not found or has no ID. Cannot create child group '{group_name}'.")
-            return # Critical error
+            return
     else:
-        # This case means parent_group_name was explicitly None or empty in the input,
-        # and constants.DEFAULT_PARENT_GROUP was also None/empty (unlikely for "Static Groups").
-        # OME might create at absolute root if ParentId is omitted or 0 in payload.
-        # The ome_client.create_static_group handles None parent_id by potentially using OME's default.
-        logger.warning(f"No parent group name specified for '{group_name}'. Attempting creation at OME default location (likely root or under default 'Static Groups' if client handles it).")
-        parent_id_for_creation = None # Let ome_client handle default if None is passed
+        logger.warning(f"No parent group name specified for '{group_name}'. OME default placement will occur.")
+        parent_id_for_creation = None # Let ome_client.create_static_group handle this (it expects int or None)
 
     try:
         logger.debug(f"Checking if group '{group_name}' exists...")
@@ -173,7 +174,6 @@ def process_group_task(ome_client_instance: ome_client.OmeClient,
             if group_task.get('create', False):
                 logger.info(f"Creating group '{group_name}' under parent ID: {parent_id_for_creation} (derived from '{parent_group_name_to_find}').")
                 try:
-                    # Pass the resolved integer parent_id_for_creation
                     new_group_id_str = ome_client_instance.create_static_group(group_name, parent_id_for_creation)
                     if new_group_id_str: group_id_to_update = new_group_id_str
                     else: logger.error(f"Group creation '{group_name}' failed to return ID. Skipping."); return

@@ -2,20 +2,20 @@
 # -*- coding: utf-8 -*-
 
 """
-OME AD Group Import Manager script (v3.1.4).
+OME AD Group Import Manager script (v3.1.5).
 Imports AD groups via OME provider, assigns roles (with default), adds scope.
 Requires AD credentials for searching groups via OME.
 """
 
-# __version__ = "3.1.3" # Previous version
-__version__ = "3.1.4" # Pass ad_group_name to ome_client.import_ad_group
+# __version__ = "3.1.4" # Previous version
+__version__ = "3.1.5" # Corrected len() call for action='append' CLI arguments.
 
 # Modifications:
 # Date       | Version | Author     | Description
 # ---------- | ------- | ---------- | -----------
 # ... (previous history) ...
-# 2025-05-12 | 3.1.3   | Gemini     | Added AD username/password args & config. Pass creds to search_ad_group_in_ome_by_name.
-# 2025-05-12 | 3.1.4   | Gemini     | Updated process_ad_import_task to pass ad_group_name to ome_client.import_ad_group.
+# 2025-05-13 | 3.1.4   | Gemini     | Updated process_ad_import_task to pass ad_group_name to ome_client.import_ad_group.
+# 2025-05-14 | 3.1.5   | Gemini     | Corrected calculation of total_cli_tasks to handle None when action='append' CLI arg is not provided.
 
 import argparse
 import sys
@@ -24,10 +24,10 @@ import json
 import requests.exceptions
 from typing import Dict, List, Optional, Tuple, Any
 
-import utils
-import constants # Ensure this is v1.2.3 or later
-import input_validator # Ensure this is v1.2.2 or later
-import ome_client # Ensure this is v1.10.9 or later
+import utils # Ensure this is utils v1.0.4 or later
+import constants # Ensure this is constants_v1_2_3_final or later
+import input_validator # Ensure this is input_validator_v1_2_2_final or later
+import ome_client # Ensure this is ome_client v1.10.9 or later (or v1.10.14 if static group changes are merged)
 
 logger = logging.getLogger(__name__)
 
@@ -53,7 +53,7 @@ def run_ad_import_workflow(ome_client_instance: ome_client.OmeClient,
                 ad_provider_id,
                 ad_search_username,
                 ad_search_password,
-                import_task, # This dict contains 'group_name'
+                import_task,
                 logger_instance
             )
         except Exception as e:
@@ -73,9 +73,9 @@ def process_ad_import_task(ome_client_instance: ome_client.OmeClient,
                            ad_provider_id: int,
                            ad_search_username: str,
                            ad_search_password: str,
-                           import_task: Dict, # Contains 'group_name', 'role_name', 'scope_name'
+                           import_task: Dict,
                            logger: logging.Logger):
-    ad_group_name = import_task.get('group_name') # Will be present
+    ad_group_name = import_task.get('group_name')
     role_name = import_task.get('role_name', constants.DEFAULT_AD_IMPORT_ROLE)
     scope_name = import_task.get('scope_name')
     logger.info(f"--- Processing AD group import: '{ad_group_name}' ---")
@@ -113,7 +113,6 @@ def process_ad_import_task(ome_client_instance: ome_client.OmeClient,
         if not imported_ome_account_id:
             logger.info(f"Importing AD group '{ad_group_name}' (GUID: {ad_group_guid}) as user with Role ID {ome_role_id}...")
             try:
-                # Pass ad_group_name to the client method for the new payload
                 import_result_id = ome_client_instance.import_ad_group(
                     ad_provider_id, ad_group_name, ad_group_guid, ome_role_id # type: ignore
                 )
@@ -176,14 +175,12 @@ def main():
     ad_search_username: Optional[str] = None
     ad_search_password: Optional[str] = None
     try:
-        # AD_CONFIG_CLI_MAP now includes ad_name, ad_username, ad_password
-        # AD_PROVIDER_REQUIRED_KEYS_FOR_FIND.union(constants.AD_CRED_REQUIRED_KEYS) ensures Name, Username, Password are required
         ad_config, is_ad_config_valid = utils.collect_and_validate_credentials(
             args, config,
             constants.AD_PROVIDER_REQUIRED_KEYS_FOR_FIND.union(constants.AD_CRED_REQUIRED_KEYS),
             constants.AD_CONFIG_SECTION,
             constants.AD_CONFIG_CLI_MAP,
-            input_validator.validate_ad_search_credentials_specific, # Validates Username & Password
+            input_validator.validate_ad_search_credentials_specific,
             logger
         )
         if not is_ad_config_valid:
@@ -193,9 +190,8 @@ def main():
         ad_search_username = ad_config.get('Username')
         ad_search_password = ad_config.get('Password')
         
-        if not ad_provider_name_for_logging: # Should be caught by validator, but defensive
+        if not ad_provider_name_for_logging:
              logger.fatal("AD Provider Name is missing. Cannot proceed."); sys.exit(1)
-        # ad_search_username and ad_search_password also checked by validator
 
         logger.info(f"Finding OME ID for Provider '{ad_provider_name_for_logging}'...")
         ad_provider_id = ome_client_instance.get_ad_provider_id_by_name(ad_provider_name_for_logging)
@@ -206,8 +202,17 @@ def main():
     except Exception as e: logger.fatal(f"Error handling AD provider/credentials: {e}", exc_info=args.debug); sys.exit(1)
 
     valid_raw_ad_imports, invalid_ad_import_details = utils.collect_and_validate_list_inputs(args, config, constants.AD_IMPORT_GROUP_CLI_ARG_NAME, constants.AD_IMPORT_GROUP_CONFIG_SECTION, input_validator.validate_ad_import_task_specific, logger)
-    total_cli_tasks = len(getattr(args, constants.AD_IMPORT_GROUP_CLI_ARG_NAME, [])); cfg_list = utils.get_config_section(config, constants.AD_IMPORT_GROUP_CONFIG_SECTION, []); total_cfg_tasks = len(cfg_list) if isinstance(cfg_list, list) else 0
-    if (total_cli_tasks + total_cfg_tasks) == 1 and not valid_raw_ad_imports: logger.fatal("Single AD import task invalid."); sys.exit(1)
+    
+    # --- CORRECTED Strict Exit Logic for AD Import Tasks ---
+    cli_ad_tasks_value = getattr(args, constants.AD_IMPORT_GROUP_CLI_ARG_NAME, None)
+    total_cli_tasks = len(cli_ad_tasks_value) if cli_ad_tasks_value is not None else 0
+    
+    config_ad_tasks_list = utils.get_config_section(config, constants.AD_IMPORT_GROUP_CONFIG_SECTION, [])
+    total_config_tasks = len(config_ad_tasks_list) if isinstance(config_ad_tasks_list, list) else 0
+    total_input_ad_tasks = total_cli_tasks + total_config_tasks
+
+    if total_input_ad_tasks == 1 and not valid_raw_ad_imports:
+        logger.fatal("Only one AD import task definition provided, and it is invalid. Cannot proceed."); sys.exit(1)
     if invalid_ad_import_details:
         logger.warning(f"Skipping {len(invalid_ad_import_details)} invalid AD import task(s):")
         for item, errors, src in invalid_ad_import_details: logger.error(f"  Invalid {src}: {item} -> {errors}")
