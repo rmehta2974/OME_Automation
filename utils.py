@@ -7,15 +7,15 @@ Includes logging setup, config loading, general input handling patterns,
 and parsing helpers.
 """
 
-# __version__ = "1.0.2" # Previous Version (Corrected argparse import)
-__version__ = "1.0.3" # Enhanced parse_devices_input for recursive file path handling in lists
+# __version__ = "1.0.3" # Previous Version (Enhanced File and List Parsing)
+__version__ = "1.0.4" # Corrected recursion in parse_devices_input for plain strings
 
 # Modifications:
 # Date       | Version | Author     | Description
 # ---------- | ------- | ---------- | -----------
 # ... (previous history) ...
-# 2025-05-13 | 1.0.2   | Rahul Mehta   | Added missing 'import argparse' for type hints.
-# 2025-05-13 | 1.0.3   | Rahul Mehta   | Modified parse_devices_input to recursively handle 'file:' prefix within list items and pass logger.
+# 2025-05-13 | 1.0.3   | Rahul Mehta    | Modified parse_devices_input to recursively handle 'file:' prefix within list items and pass logger.
+# 2025-05-13 | 1.0.4   | Rahul Mehta    | Corrected recursion in parse_devices_input to prevent infinite loops on single non-file strings.
 
 import logging
 import json
@@ -32,7 +32,6 @@ module_logger = logging.getLogger(__name__)
 def setup_logger(debug: bool = False, log_file_path: Optional[str] = None, log_level=logging.INFO):
     """
     Configures the root logger for the script.
-    (No changes from version 1.0.2)
     """
     if logging.root.hasHandlers():
         logging.root.handlers.clear()
@@ -62,7 +61,6 @@ def setup_logger(debug: bool = False, log_file_path: Optional[str] = None, log_l
 def load_config(file_path: str, logger_instance: logging.Logger) -> Optional[Dict]:
     """
     Loads and parses a JSON configuration file.
-    (No changes from version 1.0.2)
     """
     if not os.path.exists(file_path):
         logger_instance.error(f"Configuration file not found at '{file_path}'.")
@@ -89,16 +87,17 @@ def load_config(file_path: str, logger_instance: logging.Logger) -> Optional[Dic
 def get_config_section(config_data: Optional[Dict], section_name: str, default_value: Any = None) -> Any:
     """
     Safely retrieves a specific section (key) from the configuration dictionary.
-    (No changes from version 1.0.2)
     """
     if config_data is None:
         module_logger.debug(f"Config data is None, returning default for section '{section_name}'.")
         return default_value
     section_data = config_data.get(section_name, default_value)
-    if section_data is default_value and section_name in config_data:
-        module_logger.debug(f"Config section '{section_name}' found with default-like value.")
-    elif section_data is default_value: # Key not found
-         module_logger.debug(f"Config section '{section_name}' not found, returning default.")
+    # Logging for when key is found but value is default, or key not found.
+    if section_data is default_value:
+        if section_name in config_data: # Key exists, but its value is the default_value (e.g. None)
+             module_logger.debug(f"Config section '{section_name}' found but its value is the default or None.")
+        else: # Key does not exist
+             module_logger.debug(f"Config section '{section_name}' not found, returning default value.")
     else:
          module_logger.debug(f"Successfully retrieved config section '{section_name}'.")
     return section_data
@@ -108,46 +107,47 @@ def parse_devices_input(devices_input: Any, logger_instance: logging.Logger) -> 
     """
     Parses the raw 'devices' input value into a flat list of unique string identifiers.
     Handles:
-    - Direct string: "id1,id2, file:path/to/file.csv, id3" (will process file content)
-    - List: ["id1", "file:path/to/another.txt", "id2,id3"] (will process file and split CSV string)
+    - Direct string: "id1,id2,id3"
+    - Single string identifier: "dns.name.com"
+    - List: ["id1", "file:path/to/devices.txt", "id2,id3", "dns.name.com"]
     - "file:" prefix in strings to load identifiers from a file.
       The file itself can have one identifier per line or comma-separated identifiers per line.
     """
-    final_identifiers: List[str] = []
+    collected_identifiers: List[str] = []
 
     if isinstance(devices_input, str):
         stripped_input = devices_input.strip()
         if stripped_input.lower().startswith("file:"):
             file_path = stripped_input[len("file:"):]
             logger_instance.debug(f"Input string is a file path: '{file_path}'. Reading file.")
-            final_identifiers.extend(read_file_list(file_path, logger_instance))
-        else:
-            # Treat as a comma-separated string of identifiers.
-            # Each part could potentially be another "file:" directive if not handled above,
-            # but this recursive call handles it.
+            collected_identifiers.extend(read_file_list(file_path, logger_instance))
+        elif stripped_input: # It's a non-empty string, not a file path
             logger_instance.debug(f"Input string is direct CSV or single ID: '{stripped_input}'. Splitting by comma.")
-            potential_identifiers = [item.strip() for item in stripped_input.split(',') if item.strip()]
-            for pi in potential_identifiers:
-                # Recursively call to handle if an item after split is "file:..."
-                final_identifiers.extend(parse_devices_input(pi, logger_instance))
+            # These are considered final identifiers from this string. No further recursion on these parts.
+            collected_identifiers.extend([item.strip() for item in stripped_input.split(',') if item.strip()])
+        # else: empty string after strip, do nothing, will result in empty list from this branch
     elif isinstance(devices_input, list):
-        logger_instance.debug(f"Input is a list. Processing {len(devices_input)} items.")
+        logger_instance.debug(f"Input is a list. Processing {len(devices_input)} items recursively.")
         for item_in_list in devices_input:
             # Recursively call parse_devices_input for each item in the list.
-            # This handles nested lists or strings (including "file:" or CSVs) within the list.
-            final_identifiers.extend(parse_devices_input(item_in_list, logger_instance))
-    elif isinstance(devices_input, (int, float)):
+            # This handles cases where a list item might be "file:path.csv" or another "id1,id2" string.
+            collected_identifiers.extend(parse_devices_input(item_in_list, logger_instance))
+    elif isinstance(devices_input, (int, float)): # Handle numbers directly
         logger_instance.debug(f"Input is a number: {devices_input}. Converting to string.")
-        final_identifiers.append(str(devices_input).strip())
-    elif devices_input is not None: # If it's not None and not any of the handled types
-        logger_instance.warning(f"Invalid data type for 'devices' input item: {type(devices_input)} ('{devices_input}'). Expected string or list.")
-    
+        num_str = str(devices_input).strip()
+        if num_str: # Ensure it's not an empty string after conversion (unlikely for numbers)
+            collected_identifiers.append(num_str)
+    elif devices_input is not None: # Log if it's some other unhandled type but not None
+        logger_instance.warning(f"Invalid data type for 'devices' input item: {type(devices_input)} ('{devices_input}'). Expected string, list, int, or float.")
+
     # Deduplicate while preserving order (Python 3.7+)
     # If order doesn't matter, `list(set(final_identifiers))` is simpler.
     seen = set()
-    unique_identifiers = [x for x in final_identifiers if not (x in seen or seen.add(x))]
+    unique_identifiers = [x for x in collected_identifiers if not (x in seen or seen.add(x))]
     
-    logger_instance.debug(f"Final parsed unique identifiers: {unique_identifiers}")
+    if collected_identifiers != unique_identifiers:
+        logger_instance.debug(f"Removed {len(collected_identifiers) - len(unique_identifiers)} duplicate identifiers.")
+    logger_instance.debug(f"Parsed unique identifiers from this input level: {unique_identifiers}")
     return unique_identifiers
 
 
@@ -156,7 +156,6 @@ def read_file_list(file_path: str, logger_instance: logging.Logger) -> List[str]
     Reads a list of items from a file.
     Each line in the file can contain one or more identifiers separated by commas.
     All identifiers are stripped of whitespace and empty ones are skipped.
-    (No changes from version 1.0.2)
     """
     all_items: List[str] = []
     logger_instance.debug(f"Attempting to read device list from file: '{file_path}'")
@@ -180,7 +179,6 @@ def read_file_list(file_path: str, logger_instance: logging.Logger) -> List[str]
     return all_items
 
 # --- Reusable Input Collection and Validation Patterns ---
-# (collect_and_validate_credentials and collect_and_validate_list_inputs remain unchanged from v1.0.2)
 def collect_and_validate_credentials(
     args: argparse.Namespace,
     config_data: Optional[Dict],
