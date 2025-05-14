@@ -4,15 +4,16 @@ OME Client module for handling authentication and REST API interactions with
 Dell OpenManage Enterprise. Contains the main OME client class.
 """
 
-# __version__ = "1.10.8" # Previous Version
-__version__ = "1.10.9" # Updated import_ad_group method with new detailed payload
+# __version__ = "1.10.10" # Previous Version
+__version__ = "1.10.11" # Unified group membership check; create_static_group uses default "Static Groups" parent ID.
 
 # Modifications:
 # Date       | Version | Author     | Description
 # ---------- | ------- | ---------- | -----------
 # ... (previous history) ...
-# 2025-05-12 | 1.10.8  | Gemini     | Changed payload for add_scope_to_ad_group to use 'userid' and 'groupid' keys.
-# 2025-05-12 | 1.10.9  | Gemini     | Modified import_ad_group signature and payload to match user's detailed example.
+# 2025-05-14 | 1.10.10 | Rahul Mehta    | Refined group membership check in find_device_id.
+# 2025-05-14 | 1.10.11 | Rahul Mehta    | Unified group membership check in find_device_id to use $count=true,$top=0 for all types.
+#                                   | Modified create_static_group to look up ID of DEFAULT_PARENT_GROUP ("Static Groups") if no specific parent_id is given.
 
 import requests
 import logging
@@ -21,8 +22,6 @@ import socket
 from typing import Dict, List, Optional, Tuple, Any, Union
 import urllib.parse
 
-# Assuming constants.py is in the same directory or Python path
-# Use the version of constants.py that is currently in context (constants_v1_2_3)
 import constants
 
 logger = logging.getLogger(__name__)
@@ -91,39 +90,88 @@ class OmeClient:
 
     # --- Static Group Methods ---
     def find_device_id(self, identifier_type: str, identifier_value: str, target_group_id: Optional[str]=None, target_group_name: Optional[str]=None, check_target_group_membership: bool=False) -> Optional[str]:
+        """
+        Finds device ID. If check_target_group_membership is True and target_group_id
+        is provided, first checks if device is already in that specific group using $count=true.
+        """
         search_value=identifier_value; current_identifier_type=identifier_type
         if identifier_type == 'dns-name':
-            try: addr_info=socket.getaddrinfo(identifier_value, None, socket.AF_INET); ip_address = addr_info[0][4][0]; self.logger.info(f"Resolved DNS '{identifier_value}' to IP: {ip_address}")
-            except Exception as e: self.logger.error(f"DNS error '{identifier_value}': {e}"); return None
+            self.logger.debug(f"Resolving DNS name '{identifier_value}'...")
+            try:
+                addr_info=socket.getaddrinfo(identifier_value, None, socket.AF_INET); ip_address = addr_info[0][4][0]
+                self.logger.info(f"Resolved DNS '{identifier_value}' to IP: {ip_address}")
+            except socket.gaierror as e: self.logger.error(f"Failed DNS resolution for '{identifier_value}': {e}"); return None
+            except IndexError: self.logger.error(f"DNS resolution for '{identifier_value}' no IPv4."); return None
+            except Exception as e: self.logger.error(f"Unexpected DNS error for '{identifier_value}': {e}", exc_info=True); return None
             current_identifier_type='device-ip'; search_value=ip_address
+
         if check_target_group_membership and target_group_id:
+            self.logger.debug(f"Checking if device '{search_value}' ({current_identifier_type}) is in target group '{target_group_name}' (ID: {target_group_id})...")
             endpoint_key = 'group_devices'
-            if endpoint_key not in constants.API_ENDPOINTS: self.logger.error(f"Endpoint '{endpoint_key}' missing.");
+            if endpoint_key not in constants.API_ENDPOINTS:
+                self.logger.error(f"API endpoint '{endpoint_key}' not defined. Cannot check group membership.")
             else:
-                endpoint=constants.API_ENDPOINTS[endpoint_key].format(group_id=target_group_id); filter_str=None; escaped_val=str(search_value).replace("'","''")
-                if current_identifier_type == 'device-ip': filter_str = f"DeviceManagement/any(a:a/NetworkAddress eq '{escaped_val}')"
-                elif current_identifier_type == 'servicetag': filter_str = f"DeviceServiceTag eq '{escaped_val}'"
-                elif current_identifier_type == 'device-id': filter_str = f"Id eq {escaped_val}"
+                endpoint=constants.API_ENDPOINTS[endpoint_key].format(group_id=target_group_id)
+                filter_str: Optional[str]=None
+                escaped_val=str(search_value).replace("'","''")
+                
+                if current_identifier_type == 'device-ip':
+                    filter_str = f"DeviceManagement/any(a:a/NetworkAddress eq '{escaped_val}')"
+                elif current_identifier_type == 'servicetag':
+                    # Using 'Identifier' as per user's previous working filter for servicetag on this endpoint
+                    # If 'DeviceServiceTag' is the correct field on AllLeafDevices, update this.
+                    filter_str = f"Identifier eq '{escaped_val}'"
+                elif current_identifier_type == 'device-id':
+                    filter_str = f"Id eq {escaped_val}" # Assuming Id is numeric or doesn't need quotes
+                else:
+                    self.logger.error(f"Unsupported type '{current_identifier_type}' for group membership check.")
+
                 if filter_str:
                     try:
-                        params={'$filter':filter_str,'$count':'true','$top':'0'}; resp=self._send_api_request('GET',endpoint,params=params)
-                        if resp and isinstance(resp,dict):
-                            count=resp.get('@odata.count');
-                            if count is not None and int(count)>0: self.logger.info(f"Device '{identifier_value}' already in group '{target_group_name}'. Skipping."); return None
-                    except Exception as e: self.logger.error(f"Error checking group {target_group_id}: {e}. Proceeding.")
+                        # Consistently use $count=true and $top=0 for all identifier types for membership check
+                        params_for_group_check = {'$filter': filter_str, '$count': 'true', '$top': '0'}
+                        self.logger.debug(f"Group membership check: GET {endpoint} with params {params_for_group_check}")
+                        resp = self._send_api_request('GET', endpoint, params=params_for_group_check)
+
+                        if resp and isinstance(resp, dict):
+                            count_val = resp.get('@odata.count')
+                            if count_val is not None:
+                                try:
+                                    if int(count_val) > 0:
+                                        self.logger.info(f"Device '{identifier_value}' ({identifier_type}) already in target group '{target_group_name}'. Skipping.")
+                                        return None # Found in target group
+                                except (ValueError, TypeError):
+                                    self.logger.warning(f"Could not parse @odata.count '{count_val}' as int for group {target_group_id} check.")
+                            else:
+                                self.logger.warning(f"Group membership check for {target_group_id} (filter: {filter_str}) missing '@odata.count'. Response: {resp}")
+                        else:
+                            self.logger.warning(f"Unexpected response or no response for group membership check (filter: {filter_str}). Response: {resp}")
+                            
+                    except OmeApiError as api_err:
+                         if api_err.status_code != 404: self.logger.error(f"API error checking group {target_group_id}: {api_err}. Proceeding.")
+                         else: self.logger.debug(f"Target group {target_group_id} not found (404) during membership check.")
+                    except Exception as e: self.logger.error(f"Error checking group {target_group_id}: {e}. Proceeding.", exc_info=True)
+        
+        # If not returned None above, proceed to general device search
+        self.logger.debug(f"Device not in target group or check skipped. Performing general search for '{search_value}' ({current_identifier_type})...")
         filter_str=None; escaped_val=str(search_value).replace("'","''")
         if current_identifier_type == 'device-ip': filter_str = f"DeviceManagement/any(a:a/NetworkAddress eq '{escaped_val}')"
-        elif current_identifier_type == 'servicetag': filter_str = f"DeviceServiceTag eq '{escaped_val}'"
+        elif current_identifier_type == 'servicetag': filter_str = f"DeviceServiceTag eq '{escaped_val}'" # Use DeviceServiceTag for general /Devices search
         elif current_identifier_type == 'device-id': filter_str = f"Id eq {escaped_val}"
+        
         if filter_str:
             try:
                 endpoint_key = 'devices'
                 if endpoint_key not in constants.API_ENDPOINTS: self.logger.error(f"Endpoint '{endpoint_key}' missing."); return None
-                params={'$filter':filter_str,'$top':'1','$select':'Id'}; resp=self._send_api_request('GET',constants.API_ENDPOINTS[endpoint_key],params=params)
+                params={'$filter':filter_str,'$top':'1','$select':'Id'};
+                self.logger.debug(f"General device search: GET {constants.API_ENDPOINTS[endpoint_key]} with params {params}")
+                resp=self._send_api_request('GET',constants.API_ENDPOINTS[endpoint_key],params=params)
                 if resp and isinstance(resp,dict) and 'value' in resp and resp['value']:
-                    dev_id = resp['value'][0].get('Id'); return str(dev_id) if dev_id is not None else None
-                self.logger.warning(f"Device not found globally: {current_identifier_type} '{search_value}'")
-            except Exception as e: self.logger.error(f"Error in general search for '{search_value}': {e}")
+                    dev_id_raw = resp['value'][0].get('Id')
+                    if dev_id_raw is not None: return str(dev_id_raw)
+                    else: self.logger.error(f"Device found globally for '{search_value}' but its ID is null/missing."); return None
+                self.logger.warning(f"Device not found globally: {current_identifier_type} '{search_value}' (Original: '{identifier_value}' type '{identifier_type}').")
+            except Exception as e: self.logger.error(f"Error in general device search for '{search_value}': {e}", exc_info=True)
         return None
 
     def get_group_by_name(self, group_name: str) -> Optional[Dict]:
@@ -142,37 +190,83 @@ class OmeClient:
         except Exception as e: self.logger.error(f"Error getting group by name '{group_name}': {e}", exc_info=True)
         return None
 
-    def create_static_group(self, group_name: str, parent_group_id: Optional[Union[int, str]] = None) -> Optional[str]:
-        endpoint_key = 'create_group'
-        if endpoint_key not in constants.API_ENDPOINTS: self.logger.error(f"API endpoint '{endpoint_key}' missing."); raise KeyError("Endpoint 'create_group' missing.")
-        self.logger.info(f"Attempting to create static group '{group_name}' using action...")
+    def create_static_group(self, group_name: str, parent_group_id_input: Optional[Union[int, str]] = None) -> Optional[str]:
+        """
+        Creates a new static group in OME.
+        If parent_group_id_input is None or 0, it attempts to find the 'Static Groups' default parent.
+        """
+        endpoint_key = 'create_group' # User constant: /Actions/GroupService.CreateGroup
+        if endpoint_key not in constants.API_ENDPOINTS:
+            self.logger.error(f"API endpoint '{endpoint_key}' for create_group not defined.")
+            raise KeyError(f"Endpoint '{endpoint_key}' missing.")
+        
+        self.logger.info(f"Attempting to create static group '{group_name}'...")
+        
+        actual_parent_id: Optional[int] = None
+
+        if parent_group_id_input is None or str(parent_group_id_input) == "0": # Treat 0 as "use default"
+            self.logger.debug(f"No specific parent ID provided for '{group_name}'. Looking up default parent '{constants.DEFAULT_PARENT_GROUP}'.")
+            default_parent_group_obj = self.get_group_by_name(constants.DEFAULT_PARENT_GROUP)
+            if default_parent_group_obj and default_parent_group_obj.get('Id') is not None:
+                try:
+                    actual_parent_id = int(default_parent_group_obj['Id'])
+                    self.logger.info(f"Found default parent '{constants.DEFAULT_PARENT_GROUP}' with ID: {actual_parent_id}.")
+                except (ValueError, TypeError):
+                    self.logger.error(f"ID '{default_parent_group_obj['Id']}' for default parent '{constants.DEFAULT_PARENT_GROUP}' is not a valid integer. Cannot create group '{group_name}'.")
+                    return None
+            else:
+                self.logger.error(f"Default parent group '{constants.DEFAULT_PARENT_GROUP}' not found or has no ID. Cannot create group '{group_name}'.")
+                return None
+        else: # A specific parent_group_id_input was given
+            try:
+                actual_parent_id = int(parent_group_id_input)
+                self.logger.debug(f"Using provided ParentId: {actual_parent_id} for group '{group_name}'.")
+            except (ValueError, TypeError):
+                self.logger.error(f"Invalid ParentID '{parent_group_id_input}' provided for group '{group_name}'. It must be an integer. Cannot create group.")
+                return None
+
+        # Payload for CreateGroup action (VERIFY if it needs nesting e.g., {'GroupModel': {...}})
         payload = {
-            'Name': group_name, 'Description': f'Created by script {__version__}',
-            'MembershipTypeId': constants.STATIC_GROUP_MEMBERSHIP_TYPE_ID, 'ParentId': 0
+            'Name': group_name,
+            'Description': f'Created by script {__version__}',
+            'MembershipTypeId': constants.STATIC_GROUP_MEMBERSHIP_TYPE_ID,
+            'ParentId': actual_parent_id # This is now an int or None (though logic above ensures it's int if found)
         }
-        if parent_group_id is not None:
-             try: payload['ParentId'] = int(parent_group_id)
-             except (ValueError, TypeError): self.logger.error(f"Invalid ParentID '{parent_group_id}'. Using root (0)."); payload['ParentId'] = 0
-        final_payload = payload
+        # final_payload = {'GroupModel': payload} # If nesting is required by API
+        final_payload = payload # Assuming direct payload for now
         self.logger.debug(f"Payload for creating group: {final_payload}")
         try:
             response_data = self._send_api_request('POST', constants.API_ENDPOINTS[endpoint_key], json_data=final_payload)
             if response_data:
-                 new_id_raw = response_data.get('GroupId') if isinstance(response_data, dict) else \
-                              (response_data.get('Id') if isinstance(response_data, dict) else \
-                              (str(response_data) if isinstance(response_data, (str, int)) else None))
+                 # OME CreateGroup action might return GroupId directly or in a nested way
+                 new_id_raw = None
+                 if isinstance(response_data, dict):
+                     new_id_raw = response_data.get('GroupId', response_data.get('Id')) # Check common keys
+                 elif isinstance(response_data, (str, int)):
+                     new_id_raw = str(response_data)
+                 
                  if new_id_raw is not None:
                     new_id_str = str(new_id_raw).strip()
-                    if new_id_str: self.logger.info(f"Created group '{group_name}' ID: {new_id_str}."); return new_id_str
-            self.logger.error(f"Group creation '{group_name}' failed or no ID returned.")
+                    if new_id_str:
+                        self.logger.info(f"Successfully created group '{group_name}' with ID: {new_id_str}.")
+                        return new_id_str
+            self.logger.error(f"Group creation '{group_name}' failed or no ID returned from API. Response: {response_data}")
             return None
-        except Exception as e: self.logger.error(f"Error creating group '{group_name}': {e}", exc_info=True); raise e
+        except Exception as e:
+            self.logger.error(f"Error creating group '{group_name}': {e}", exc_info=True)
+            raise e # Re-raise for process_group_task to handle
 
     def add_devices_to_group(self, group_id: str, device_ids: List[str]):
         if not device_ids: self.logger.info(f"No devices to add to group {group_id}."); return
         endpoint_key = 'add_devices_to_group'
         if endpoint_key not in constants.API_ENDPOINTS: self.logger.error(f"API endpoint '{endpoint_key}' missing."); raise KeyError(f"Endpoint '{endpoint_key}' missing.")
-        payload = { 'GroupId': int(group_id), 'MemberDeviceIds': [int(did) for did in device_ids] }
+        # Payload for AddMemberDevices action (VERIFY types, OME often expects integers for IDs)
+        try:
+            payload = { 'GroupId': int(group_id), 'MemberDeviceIds': [int(did) for did in device_ids] }
+        except ValueError:
+            self.logger.error(f"Invalid GroupId ('{group_id}') or DeviceId in list for AddMemberDevices. IDs must be integers.")
+            raise ValueError("Invalid ID format for AddMemberDevices.")
+
         self.logger.info(f"Adding {len(device_ids)} devices to group {group_id} via action {constants.API_ENDPOINTS[endpoint_key]}...")
         self.logger.debug(f"Payload for AddMemberDevices: {payload}")
         try:
@@ -185,9 +279,7 @@ class OmeClient:
     # --- AD Group Import Related Methods ---
     def get_ad_provider_id_by_name(self, ad_provider_name: str) -> Optional[int]:
         endpoint_key = 'external_account_providers'
-        if endpoint_key not in constants.API_ENDPOINTS:
-            self.logger.error(f"API endpoint '{endpoint_key}' for AD providers not defined.")
-            return None
+        if endpoint_key not in constants.API_ENDPOINTS: self.logger.error(f"API endpoint '{endpoint_key}' missing."); return None
         self.logger.debug(f"Finding AD Provider ID for name: '{ad_provider_name}' using {constants.API_ENDPOINTS[endpoint_key]}...")
         try:
             response_data = self._send_api_request('GET', constants.API_ENDPOINTS[endpoint_key])
@@ -210,24 +302,20 @@ class OmeClient:
         self.logger.debug(f"Searching AD group '{ad_group_name}' via OME Provider ID {ad_provider_id} using AD creds...")
         endpoint = constants.API_ENDPOINTS[endpoint_key];
         payload = {
-            "DirectoryServerId": ad_provider_id,
-            "CommonName": ad_group_name,
-            "Type": constants.AD_SEARCH_TYPE,
-            "Username": ad_username,
-            "Password": ad_password
+            "DirectoryServerId": ad_provider_id, "CommonName": ad_group_name,
+            "Type": constants.AD_SEARCH_TYPE, "Username": ad_username, "Password": ad_password
         }
         self.logger.debug(f"Payload for AD Group Search Action ({endpoint}): {payload}")
         try:
             response_data = self._send_api_request('POST', endpoint, json_data=payload)
             found_groups: List[Dict] = []
-            if response_data and isinstance(response_data, dict) and 'value' in response_data and isinstance(response_data['value'], list):
-                found_groups = response_data['value']
+            if response_data and isinstance(response_data, dict) and 'value' in response_data and isinstance(response_data['value'], list): found_groups = response_data['value']
             elif response_data and isinstance(response_data, list): found_groups = response_data
             if found_groups:
                 group_info = found_groups[0]
-                if group_info.get('Guid'): self.logger.info(f"Found AD group '{ad_group_name}' with GUID '{group_info.get('Guid')}' via OME search."); return group_info
+                if group_info.get('Guid'): self.logger.info(f"Found AD group '{ad_group_name}' GUID '{group_info.get('Guid')}' via OME."); return group_info
                 else: self.logger.error(f"AD group '{ad_group_name}' found but missing 'Guid'."); return None
-            else: self.logger.warning(f"AD group '{ad_group_name}' not found via OME search using Provider ID {ad_provider_id}."); return None
+            else: self.logger.warning(f"AD group '{ad_group_name}' not found via OME search (Provider ID {ad_provider_id})."); return None
         except Exception as e: self.logger.error(f"Error searching AD group '{ad_group_name}' via OME: {e}", exc_info=True); return None
 
     def get_role_id_by_name(self, role_name: str) -> Optional[str]:
@@ -248,58 +336,28 @@ class OmeClient:
         return None
 
     def import_ad_group(self, ad_provider_id: int, ad_group_name: str, ad_group_guid: str, role_id: str) -> Optional[str]:
-        """
-        Imports an AD group as an OME Account using the new detailed payload.
-        The role_id from input is expected to be the OME Role ID (string).
-        """
-        endpoint_key = 'import_ad_group' # AccountService.ImportExternalAccountProvider
-        if endpoint_key not in constants.API_ENDPOINTS:
-            self.logger.error(f"API endpoint '{endpoint_key}' for AD group import not defined.")
-            return None
-
-        self.logger.info(f"Importing AD group '{ad_group_name}' (GUID: {ad_group_guid}) from Provider ID {ad_provider_id} with Role ID {role_id} as OME Account...")
-        endpoint = constants.API_ENDPOINTS[endpoint_key]
-
-        # Construct payload based on user's new example
+        endpoint_key = 'import_ad_group'
+        if endpoint_key not in constants.API_ENDPOINTS: self.logger.error(f"API endpoint '{endpoint_key}' missing."); return None
+        self.logger.info(f"Importing AD group '{ad_group_name}' (GUID: {ad_group_guid}, Provider {ad_provider_id}, Role {role_id}) as OME Account...")
+        endpoint = constants.API_ENDPOINTS[endpoint_key];
         payload = {
-            "UserTypeId": 2,  # Constant for AD group user type
-            "DirectoryServiceId": ad_provider_id, # OME ID of the AD Provider (int)
-            "Description": ad_group_name, # Use AD group name for description
-            "Name": ad_group_name,        # Use AD group name for OME account name
-            "Password": "",               # Empty string as per example
-            "UserName": ad_group_name,    # Use AD group name for OME username
-            "RoleId": role_id,            # OME Role ID (string, as per example "10")
-            "Locked": False,              # Constant
-            "Enabled": True,              # Constant
-            "ObjectGuid": ad_group_guid   # GUID of the AD group
+            "UserTypeId": 2, "DirectoryServiceId": ad_provider_id, "Description": ad_group_name,
+            "Name": ad_group_name, "Password": "", "UserName": ad_group_name,
+            "RoleId": role_id, "Locked": False, "Enabled": True, "ObjectGuid": ad_group_guid
         }
         self.logger.debug(f"Payload for AD Group Import as Account (action: {endpoint}): {payload}")
-
         try:
-            # This action is typically a POST request
             response_data = self._send_api_request('POST', endpoint, json_data=payload)
-
-            # Process response: OME might return the new Account ID or a Job ID
             if response_data:
-                 # Check for 'Id' which is common for created resources
-                 new_account_id_raw = response_data.get('Id') if isinstance(response_data, dict) else \
-                                   (str(response_data) if isinstance(response_data, (str, int)) else None)
-                 if new_account_id_raw is not None:
-                    new_account_id_str = str(new_account_id_raw).strip()
-                    if new_account_id_str:
-                        self.logger.info(f"AD Group '{ad_group_name}' import successful. OME Account ID (or Job ID): {new_account_id_str}")
-                        return new_account_id_str # This could be the Account ID or a Job ID
-            self.logger.error(f"AD group import for '{ad_group_name}' (GUID: {ad_group_guid}) failed or no ID returned from API.")
-            return None
-        except Exception as e:
-            self.logger.error(f"Error importing AD group '{ad_group_name}' (GUID: {ad_group_guid}) as OME Account: {e}", exc_info=True)
-            raise e # Re-raise for process_ad_import_task to handle
+                 new_id_raw = response_data.get('Id') if isinstance(response_data, dict) else (str(response_data) if isinstance(response_data, (str, int)) else None)
+                 if new_id_raw is not None and str(new_id_raw).strip(): return str(new_id_raw).strip()
+            self.logger.error(f"AD group import for '{ad_group_name}' failed or no OME Account ID returned."); return None
+        except Exception as e: self.logger.error(f"Error importing AD group '{ad_group_name}': {e}", exc_info=True); raise e
 
     def get_imported_ad_group_by_guid(self, ad_group_guid: str) -> Optional[Dict]:
         endpoint_key = 'accounts'
         if endpoint_key not in constants.API_ENDPOINTS: self.logger.error(f"API endpoint '{endpoint_key}' missing."); return None
-        ad_guid_field_name = 'ObjectGuid' # Changed to match the import payload's GUID field. VERIFY if this is filterable on Accounts.
-                                         # Or it might still be 'ExternalIdentifier'
+        ad_guid_field_name = 'ObjectGuid'
         self.logger.debug(f"Searching OME Accounts for GUID '{ad_group_guid}' using field '{ad_guid_field_name}'...")
         filter_string = f"{ad_guid_field_name} eq '{ad_group_guid}'"
         try:
@@ -325,3 +383,4 @@ class OmeClient:
             elif isinstance(response_data, dict) and 'Id' in response_data: self.logger.info(f"Add scope job created for Account ID {ome_account_id}. Job ID: {response_data['Id']}")
             else: self.logger.info(f"Add scope request sent for Account ID {ome_account_id}. Response: {str(response_data)[:100]}")
         except Exception as e: self.logger.error(f"Error adding scope to OME Account ID {ome_account_id}: {e}", exc_info=True); raise e
+
