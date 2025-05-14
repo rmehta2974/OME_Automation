@@ -2,20 +2,22 @@
 # -*- coding: utf-8 -*-
 
 """
-OME AD Group Import Manager script (v3.1.5).
+OME AD Group Import Manager script (v3.1.7).
 Imports AD groups via OME provider, assigns roles (with default), adds scope.
 Requires AD credentials for searching groups via OME.
+Checks for existing OME account by UserName before import.
 """
 
-# __version__ = "3.1.4" # Previous version
-__version__ = "3.1.5" # Corrected len() call for action='append' CLI arguments.
+# __version__ = "3.1.6" # Previous version
+__version__ = "3.1.7" # Uses updated ome_client with new import payload and pre-check by UserName.
 
 # Modifications:
 # Date       | Version | Author     | Description
 # ---------- | ------- | ---------- | -----------
 # ... (previous history) ...
-# 2025-05-13 | 3.1.4   | Gemini     | Updated process_ad_import_task to pass ad_group_name to ome_client.import_ad_group.
-# 2025-05-14 | 3.1.5   | Gemini     | Corrected calculation of total_cli_tasks to handle None when action='append' CLI arg is not provided.
+# 2025-05-15 | 3.1.6   | Gemini     | Aligned with ome_client changes for AD search payload (UserName) and GUID field (ObjectGuid).
+# 2025-05-15 | 3.1.7   | Gemini     | Updated process_ad_import_task to use get_imported_ad_account_by_username for pre-check.
+#                                   | Ensured import_ad_group is called with new payload structure (list of dict).
 
 import argparse
 import sys
@@ -24,10 +26,10 @@ import json
 import requests.exceptions
 from typing import Dict, List, Optional, Tuple, Any
 
-import utils # Ensure this is utils v1.0.4 or later
-import constants # Ensure this is constants_v1_2_3_final or later
-import input_validator # Ensure this is input_validator_v1_2_2_final or later
-import ome_client # Ensure this is ome_client v1.10.9 or later (or v1.10.14 if static group changes are merged)
+import utils # Ensure this is v1.0.4 or later
+import constants # Ensure this is v1.2.3 or later
+import input_validator # Ensure this is v1.2.2 or later
+import ome_client # Ensure this is v1.10.23 or later
 
 logger = logging.getLogger(__name__)
 
@@ -80,7 +82,8 @@ def process_ad_import_task(ome_client_instance: ome_client.OmeClient,
     scope_name = import_task.get('scope_name')
     logger.info(f"--- Processing AD group import: '{ad_group_name}' ---")
     logger.debug(f"Task Details: AD Group='{ad_group_name}', Role='{role_name}', Scope='{scope_name or 'None'}'")
-    ad_group_guid: Optional[str] = None
+    
+    ad_object_guid: Optional[str] = None
     ome_role_id: Optional[str] = None
     imported_ome_account_id: Optional[str] = None
     try:
@@ -88,10 +91,10 @@ def process_ad_import_task(ome_client_instance: ome_client.OmeClient,
         ad_group_details = ome_client_instance.search_ad_group_in_ome_by_name(
             ad_provider_id, ad_group_name, ad_search_username, ad_search_password
         )
-        if ad_group_details and ad_group_details.get('Guid'):
-            ad_group_guid = str(ad_group_details['Guid'])
-            logger.info(f"Found AD group '{ad_group_name}' with GUID: {ad_group_guid}")
-        else: logger.error(f"AD group '{ad_group_name}' not found via OME search or GUID missing. Skipping."); return
+        if ad_group_details and ad_group_details.get('ObjectGuid'):
+            ad_object_guid = str(ad_group_details['ObjectGuid'])
+            logger.info(f"Found AD group '{ad_group_name}' with ObjectGuid: {ad_object_guid}")
+        else: logger.error(f"AD group '{ad_group_name}' not found via OME search or ObjectGuid missing. Skipping."); return
 
         logger.debug(f"Finding OME Role ID for role name '{role_name}'...")
         ome_role_id_raw = ome_client_instance.get_role_id_by_name(role_name)
@@ -100,21 +103,23 @@ def process_ad_import_task(ome_client_instance: ome_client.OmeClient,
             logger.info(f"Found OME Role ID for '{role_name}': {ome_role_id}")
         else: logger.error(f"OME Role '{role_name}' not found. Skipping task for AD group '{ad_group_name}'."); return
 
-        logger.debug(f"Checking if AD group (GUID: {ad_group_guid}) is already imported as a user in OME...")
-        existing_ome_user_account = ome_client_instance.get_imported_ad_group_by_guid(ad_group_guid)
-        if existing_ome_user_account:
-             existing_ome_user_id_raw = existing_ome_user_account.get('Id')
-             if existing_ome_user_id_raw is not None:
-                 imported_ome_account_id = str(existing_ome_user_id_raw)
-                 logger.warning(f"AD group '{ad_group_name}' already imported as user (Account ID: {imported_ome_account_id}). Skipping import.")
-             else: logger.warning(f"AD group GUID '{ad_group_guid}' found imported but OME Account ID missing. Attempting import.")
-        else: logger.debug(f"AD group GUID '{ad_group_guid}' not imported. Will proceed with import.")
+        # Check if OME Account already exists by UserName (which is ad_group_name)
+        logger.debug(f"Checking if OME Account with UserName '{ad_group_name}' already exists...")
+        existing_ome_account = ome_client_instance.get_imported_ad_account_by_username(ad_group_name)
+        if existing_ome_account:
+             existing_ome_account_id_raw = existing_ome_account.get('Id')
+             if existing_ome_account_id_raw is not None:
+                 imported_ome_account_id = str(existing_ome_account_id_raw)
+                 logger.warning(f"OME Account with UserName '{ad_group_name}' already exists (ID: {imported_ome_account_id}). AD Group ObjectGuid: {existing_ome_account.get('ObjectGuid', 'N/A')}. Skipping import.")
+             else: # Should not happen if account found by name
+                  logger.warning(f"OME Account with UserName '{ad_group_name}' found but OME Account ID missing. Attempting import.")
+        else: logger.debug(f"OME Account with UserName '{ad_group_name}' not found. Will proceed with import.")
 
         if not imported_ome_account_id:
-            logger.info(f"Importing AD group '{ad_group_name}' (GUID: {ad_group_guid}) as user with Role ID {ome_role_id}...")
+            logger.info(f"Importing AD group '{ad_group_name}' (ObjectGuid: {ad_object_guid}) as user with Role ID {ome_role_id}...")
             try:
                 import_result_id = ome_client_instance.import_ad_group(
-                    ad_provider_id, ad_group_name, ad_group_guid, ome_role_id # type: ignore
+                    ad_provider_id, ad_group_name, ad_object_guid, ome_role_id # type: ignore
                 )
                 if import_result_id:
                     imported_ome_account_id = str(import_result_id)
@@ -202,17 +207,11 @@ def main():
     except Exception as e: logger.fatal(f"Error handling AD provider/credentials: {e}", exc_info=args.debug); sys.exit(1)
 
     valid_raw_ad_imports, invalid_ad_import_details = utils.collect_and_validate_list_inputs(args, config, constants.AD_IMPORT_GROUP_CLI_ARG_NAME, constants.AD_IMPORT_GROUP_CONFIG_SECTION, input_validator.validate_ad_import_task_specific, logger)
-    
-    # --- CORRECTED Strict Exit Logic for AD Import Tasks ---
     cli_ad_tasks_value = getattr(args, constants.AD_IMPORT_GROUP_CLI_ARG_NAME, None)
     total_cli_tasks = len(cli_ad_tasks_value) if cli_ad_tasks_value is not None else 0
-    
     config_ad_tasks_list = utils.get_config_section(config, constants.AD_IMPORT_GROUP_CONFIG_SECTION, [])
     total_config_tasks = len(config_ad_tasks_list) if isinstance(config_ad_tasks_list, list) else 0
-    total_input_ad_tasks = total_cli_tasks + total_config_tasks
-
-    if total_input_ad_tasks == 1 and not valid_raw_ad_imports:
-        logger.fatal("Only one AD import task definition provided, and it is invalid. Cannot proceed."); sys.exit(1)
+    if (total_cli_tasks + total_config_tasks) == 1 and not valid_raw_ad_imports: logger.fatal("Single AD import task invalid."); sys.exit(1)
     if invalid_ad_import_details:
         logger.warning(f"Skipping {len(invalid_ad_import_details)} invalid AD import task(s):")
         for item, errors, src in invalid_ad_import_details: logger.error(f"  Invalid {src}: {item} -> {errors}")
