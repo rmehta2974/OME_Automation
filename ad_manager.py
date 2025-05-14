@@ -8,8 +8,8 @@ Requires AD credentials for searching groups via OME.
 Checks for existing OME account by UserName before import.
 """
 
-# __version__ = "3.1.6" # Previous version (aligned with ome_client v1.10.22)
-__version__ = "3.1.7" # Uses get_imported_ad_account_by_username for pre-import check.
+# __version__ = "3.1.6" # Previous version
+__version__ = "3.1.7" # Uses updated ome_client with new import payload and pre-check by UserName.
 
 # Modifications:
 # Date       | Version | Author     | Description
@@ -17,6 +17,7 @@ __version__ = "3.1.7" # Uses get_imported_ad_account_by_username for pre-import 
 # ... (previous history) ...
 # 2025-05-15 | 3.1.6   | Gemini     | Aligned with ome_client changes for AD search payload (UserName) and GUID field (ObjectGuid).
 # 2025-05-15 | 3.1.7   | Gemini     | Updated process_ad_import_task to use get_imported_ad_account_by_username for pre-check.
+#                                   | Ensured import_ad_group is called with new payload structure (list of dict).
 
 import argparse
 import sys
@@ -102,38 +103,37 @@ def process_ad_import_task(ome_client_instance: ome_client.OmeClient,
             logger.info(f"Found OME Role ID for '{role_name}': {ome_role_id}")
         else: logger.error(f"OME Role '{role_name}' not found. Skipping task for AD group '{ad_group_name}'."); return
 
-        # --- Check if OME Account already exists by UserName (which is ad_group_name) ---
-        logger.debug(f"Checking if OME Account with UserName '{ad_group_name}' (derived from AD group name) already exists...")
+        # Check if OME Account already exists by UserName (which is ad_group_name)
+        logger.info(f"Checking if OME Account with UserName '{ad_group_name}' already exists...")
         existing_ome_account = ome_client_instance.get_imported_ad_account_by_username(ad_group_name)
         if existing_ome_account:
              existing_ome_account_id_raw = existing_ome_account.get('Id')
              if existing_ome_account_id_raw is not None:
                  imported_ome_account_id = str(existing_ome_account_id_raw)
-                 # Verify if the found account's ObjectGuid matches the one we just searched for, if available
-                 # This is an extra sanity check if OME stores ObjectGuid on the account object.
-                 found_object_guid = existing_ome_account.get('ObjectGuid')
-                 if found_object_guid and found_object_guid == ad_object_guid:
-                    logger.warning(f"OME Account with UserName '{ad_group_name}' and matching ObjectGuid '{ad_object_guid}' already exists (Account ID: {imported_ome_account_id}). Skipping import.")
-                 elif found_object_guid: # Username matches, but GUID doesn't (or vice-versa if GUID was primary check)
-                    logger.warning(f"OME Account with UserName '{ad_group_name}' exists (ID: {imported_ome_account_id}), but its ObjectGuid ('{found_object_guid}') does not match the searched AD group's ObjectGuid ('{ad_object_guid}'). This might indicate a naming collision or an old record. Proceeding with caution or specific handling might be needed.")
-                    # For now, we will still use this existing account ID if username matches, but log the discrepancy.
-                 else: # Username matches, but no ObjectGuid on the OME account to compare
-                    logger.warning(f"OME Account with UserName '{ad_group_name}' exists (ID: {imported_ome_account_id}), but no ObjectGuid found on the OME account for comparison. Skipping import based on UserName match.")
-             else: # Account found by UserName but has no ID - unlikely but handle
-                  logger.warning(f"OME Account with UserName '{ad_group_name}' found but OME Account ID missing. Attempting import.")
-        else: logger.debug(f"OME Account with UserName '{ad_group_name}' not found. Will proceed with import.")
+                 found_object_guid = existing_ome_account.get('ObjectGuid', 'NOT_FOUND_ON_ACCOUNT')
+                 logger.warning(f"OME Account with UserName '{ad_group_name}' already exists (ID: {imported_ome_account_id}). Its ObjectGuid on OME: '{found_object_guid}'. Searched AD group ObjectGuid: '{ad_object_guid}'. Skipping import.")
+             else: 
+                  logger.warning(f"OME Account with UserName '{ad_group_name}' found but OME Account ID missing. Attempting import as a precaution.")
+                  # imported_ome_account_id remains None, so import will be attempted
+        else: 
+            logger.info(f"OME Account with UserName '{ad_group_name}' not found. Will proceed with import.")
 
         if not imported_ome_account_id: # If no existing account was found by UserName or if it was problematic
-            logger.info(f"Importing AD group '{ad_group_name}' (ObjectGuid: {ad_object_guid}) as user with Role ID {ome_role_id}...")
+            logger.info(f"Attempting to import AD group '{ad_group_name}' (ObjectGuid: {ad_object_guid}) as user with Role ID {ome_role_id}...")
             try:
+                # Pass ad_group_name and ad_object_guid to the client method
                 import_result_id = ome_client_instance.import_ad_group(
                     ad_provider_id, ad_group_name, ad_object_guid, ome_role_id # type: ignore
                 )
                 if import_result_id:
                     imported_ome_account_id = str(import_result_id)
-                    logger.info(f"AD group '{ad_group_name}' imported as user. OME Account ID: {imported_ome_account_id}")
-                else: logger.error(f"AD group import for '{ad_group_name}' failed or no OME Account ID returned. Skipping scope."); return
-            except Exception as e: logger.error(f"Error importing AD group '{ad_group_name}' as user: {e}. Skipping scope.", exc_info=logger.isEnabledFor(logging.DEBUG)); return
+                    logger.info(f"AD group '{ad_group_name}' imported as user. New OME Account ID: {imported_ome_account_id}")
+                else: 
+                    logger.error(f"AD group import for '{ad_group_name}' failed or returned no OME Account ID. Skipping scope assignment.")
+                    return
+            except Exception as e: 
+                logger.error(f"Error during AD group import for '{ad_group_name}': {e}. Skipping scope assignment.", exc_info=logger.isEnabledFor(logging.DEBUG))
+                return
 
         if scope_name and imported_ome_account_id: # Proceed with scope if we have an account ID (either existing or newly imported)
             logger.info(f"Scope '{scope_name}' requested for OME Account ID: {imported_ome_account_id} (AD Group: '{ad_group_name}'). Searching for scope group...")
@@ -144,8 +144,10 @@ def process_ad_import_task(ome_client_instance: ome_client.OmeClient,
                 try: ome_client_instance.add_scope_to_ad_group(imported_ome_account_id, scope_group_id_str)
                 except Exception as e: logger.error(f"Error assigning scope '{scope_name}' to OME Account '{imported_ome_account_id}': {e}", exc_info=logger.isEnabledFor(logging.DEBUG))
             else: logger.warning(f"Static group for Scope ('{scope_name}') not found. Scope not assigned for OME Account '{imported_ome_account_id}'.")
-        elif scope_name: logger.warning(f"Cannot process scope '{scope_name}' because OME Account ID for AD group '{ad_group_name}' could not be determined.")
-    except Exception as e: logger.error(f"Unexpected error processing task for AD group '{ad_group_name}': {e}", exc_info=True)
+        elif scope_name: 
+            logger.warning(f"Cannot process scope '{scope_name}' because OME Account ID for AD group '{ad_group_name}' could not be determined.")
+    except Exception as e: 
+        logger.error(f"Unexpected error processing task for AD group '{ad_group_name}': {e}", exc_info=True)
     logger.info(f"--- Finished processing AD group import for '{ad_group_name}' ---")
 
 #------------------------------------------------------------------------------
@@ -203,7 +205,7 @@ def main():
         ad_search_username = ad_config.get('Username')
         ad_search_password = ad_config.get('Password')
         
-        if not ad_provider_name_for_logging:
+        if not ad_provider_name_for_logging: # Should be caught by validator, but defensive
              logger.fatal("AD Provider Name is missing. Cannot proceed."); sys.exit(1)
 
         logger.info(f"Finding OME ID for Provider '{ad_provider_name_for_logging}'...")

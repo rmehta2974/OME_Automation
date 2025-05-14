@@ -1,18 +1,18 @@
 # -*- coding: utf-8 -*-
 """Contains specific validation logic"""
 
-# __version__ = "1.2.1" # Previous version (from immersive input_validator_v1_2_1)
-__version__ = "1.2.2" # Added validate_ad_search_credentials_specific
+# __version__ = "1.2.2" # Previous version
+__version__ = "1.2.3" # Allow Scope to be string or list of strings in AD import task
 
 # Modifications:
 # Date       | Version | Author     | Description
 # ---------- | ------- | ---------- | -----------
-# ... (previous history from input_validator_v1_2_1) ...
-# 2025-05-12 | 1.2.1   | Rahul Mehta    | Simplified validate_ad_provider_config_specific to only check 'Name'.
-# 2025-05-13 | 1.2.2   | Rahul Mehta    | Added validate_ad_search_credentials_specific for AD username/password used in search.
+# ...
+# 2025-05-12 | 1.2.2   | Gemini     | Added validate_ad_search_credentials_specific for AD username/password.
+# 2025-05-15 | 1.2.3   | Gemini     | Modified validate_ad_import_task_specific to allow 'Scope' to be a string or a list of strings.
 
 import logging
-import constants # Ensure this points to constants_v1_2_3_final
+import constants # Ensure this is constants_v1_2_3_final or later
 from typing import Dict, List, Optional, Tuple, Any
 
 logger = logging.getLogger(__name__)
@@ -52,55 +52,40 @@ def validate_static_group_definition_specific(group_dict: Dict, source_info: str
     return is_valid, errors
 
 def validate_ad_provider_config_specific(ad_config_dict: Dict, source_info: str) -> Tuple[bool, List[str]]:
-    """
-    Validates AD provider config - only 'Name' for finding existing.
-    This validator is used when we only need the Name to find the provider.
-    If AD credentials are also collected in the same step, they should be validated by a different or combined validator.
-    """
-    context_name=f"AD Provider Name Config from {source_info}"
+    """Validates AD provider config - only 'Name' for finding existing."""
+    context_name=f"AD Provider Config from {source_info}"
     logger.debug(f"Validating {context_name} (checking only Name)...")
-    required_keys = constants.AD_PROVIDER_REQUIRED_KEYS_FOR_FIND # {'Name'}
+    required_keys = constants.AD_PROVIDER_REQUIRED_KEYS_FOR_FIND
     is_valid, errors = validate_input(ad_config_dict, required_keys, context_name=context_name)
-
     if 'Name' in ad_config_dict and (not isinstance(ad_config_dict.get('Name'), str) or not str(ad_config_dict.get('Name')).strip()):
         errors.append("'Name' (for AD Provider) must be a non-empty string.")
         is_valid = False
     is_valid = (len(errors) == 0) and is_valid
     return is_valid, errors
 
-# --- NEW: Validator for AD Credentials used in Search ---
 def validate_ad_search_credentials_specific(ad_creds_dict: Dict, source_info: str) -> Tuple[bool, List[str]]:
-    """
-    Validates AD credentials (Username, Password) for the search operation.
-    Also implicitly checks for 'Name' if it's part of the required_keys passed to utils.collect_and_validate_credentials.
-    """
+    """Validates AD credentials (Username, Password) for the search operation."""
     context_name = f"AD Search Credentials & Provider Name from {source_info}"
     logger.debug(f"Validating {context_name}...")
-    # The calling function in ad_import_manager.py will pass required_keys that include Name, Username, Password
-    # So, validate_input will check for their presence. Here we do value checks.
     is_valid, errors = validate_input(
         ad_creds_dict,
-        constants.AD_PROVIDER_REQUIRED_KEYS_FOR_FIND.union(constants.AD_CRED_REQUIRED_KEYS), # Ensures Name, Username, Password are checked for presence
+        constants.AD_PROVIDER_REQUIRED_KEYS_FOR_FIND.union(constants.AD_CRED_REQUIRED_KEYS),
         context_name=context_name
     )
-
-    # Value check for Name (even though presence is checked by validate_input)
     if 'Name' in ad_creds_dict and (not isinstance(ad_creds_dict.get('Name'), str) or not str(ad_creds_dict.get('Name')).strip()):
         errors.append("AD Provider 'Name' must be a non-empty string.")
         is_valid = False
-
-    # Value checks for AD search credentials
     if 'Username' in ad_creds_dict and (not isinstance(ad_creds_dict.get('Username'), str) or not str(ad_creds_dict.get('Username')).strip()):
         errors.append("AD 'Username' for search must be a non-empty string.")
         is_valid = False
-    if 'Password' in ad_creds_dict and not isinstance(ad_creds_dict.get('Password'), str): # Allow empty password if AD permits
+    if 'Password' in ad_creds_dict and not isinstance(ad_creds_dict.get('Password'), str):
         errors.append("AD 'Password' for search must be a string.")
         is_valid = False
-
-    is_valid = (len(errors) == 0) and is_valid # Update validity based on these specific checks
+    is_valid = (len(errors) == 0) and is_valid
     return is_valid, errors
 
 def validate_ad_import_task_specific(import_task_dict: Dict, source_info: str) -> Tuple[bool, List[str]]:
+    """Performs specific validation for a single AD import group task dictionary."""
     context_name = f"AD Import Task from {source_info}"
     logger.debug(f"Validating {context_name}...")
     is_valid, errors = validate_input(
@@ -116,9 +101,25 @@ def validate_ad_import_task_specific(import_task_dict: Dict, source_info: str) -
        (not isinstance(import_task_dict.get('role_name'), str) or not str(import_task_dict.get('role_name')).strip()):
         errors.append("'role_name' value must be a non-empty string if provided.")
         is_valid = False
-    if 'Scope' in import_task_dict and import_task_dict.get('Scope') is not None and \
-       (not isinstance(import_task_dict.get('Scope'), str) or not str(import_task_dict.get('Scope')).strip()):
-        errors.append("'Scope' value must be a non-empty string if provided.")
-        is_valid = False
+    
+    # Validate 'Scope' field: can be a non-empty string or a list of non-empty strings
+    if 'Scope' in import_task_dict and import_task_dict.get('Scope') is not None:
+        scope_value = import_task_dict.get('Scope')
+        if isinstance(scope_value, str):
+            if not scope_value.strip():
+                errors.append("'Scope' string value must be non-empty if provided.")
+                is_valid = False
+        elif isinstance(scope_value, list):
+            if not scope_value: # Empty list
+                errors.append("'Scope' list must not be empty if provided as a list.")
+                is_valid = False
+            for i, item in enumerate(scope_value):
+                if not isinstance(item, str) or not item.strip():
+                    errors.append(f"'Scope' list item at index {i} must be a non-empty string.")
+                    is_valid = False
+        else:
+            errors.append("'Scope' value must be a non-empty string or a list of non-empty strings if provided.")
+            is_valid = False
+            
     is_valid = (len(errors) == 0) and is_valid
     return is_valid, errors

@@ -4,23 +4,20 @@ OME Client module for handling authentication and REST API interactions with
 Dell OpenManage Enterprise. Contains the main OME client class.
 """
 
-# __version__ = "1.10.22" # Previous Version
-__version__ = "1.10.23" # Updated AD search payload (UserName), GUID field (ObjectGuid),
-                        # import payload (list of dict), and pre-import check (by UserName).
-                        # Confirmed scope payload uses userid/groupid.
+# __version__ = "1.10.23" # Previous Version
+__version__ = "1.10.24" # Updated add_scope_to_ad_group payload to use "UserId" and "Groups" (list).
 
 # Modifications:
 # Date       | Version | Author     | Description
 # ---------- | ------- | ---------- | -----------
-# ... (previous history) ...
-# 2025-05-15 | 1.10.22 | Rahul Mehta     | Ensured search_ad_group_in_ome_by_name uses "UserName" and expects "ObjectGuid".
-#                                   | Ensured import_ad_group payload uses "ObjectGuid".
-#                                   | Ensured get_imported_ad_group_by_guid filters by "ObjectGuid".
+# ... (previous history from v1.10.23) ...
 # 2025-05-15 | 1.10.23 | Rahul Mehta     | search_ad_group_in_ome_by_name payload key for username is "UserName".
 #                                   | search_ad_group_in_ome_by_name expects "ObjectGuid" in response.
 #                                   | import_ad_group payload is now a list containing one dict with specified fields.
 #                                   | get_imported_ad_group_by_guid renamed to get_imported_ad_account_by_username, iterates all accounts.
 #                                   | add_scope_to_ad_group payload uses "userid" and "groupid".
+# 2025-05-15 | 1.10.24 | Rahul Mehta     | Changed add_scope_to_ad_group payload to use "UserId" and "Groups" (list of int IDs).
+#                                   | Method signature changed to accept a list of static group IDs.
 
 import requests
 import logging
@@ -67,7 +64,7 @@ class OmeClient:
             else: raise AuthenticationError(f"Auth failed, status: {response.status_code}.")
         except Exception as e: self.logger.error(f"Auth error: {e}"); raise e
 
-    def _send_api_request(self, method: str, endpoint: str, json_data: Optional[Union[Dict, List]] = None, params: Optional[Dict] = None) -> Optional[Union[Dict, List, str]]: # json_data can be list now
+    def _send_api_request(self, method: str, endpoint: str, json_data: Optional[Union[Dict, List]] = None, params: Optional[Dict] = None) -> Optional[Union[Dict, List, str]]:
         if not endpoint.startswith('/'): base_url = f"{self.url}/{endpoint}"
         else: base_url = f"{self.url}{endpoint}"
         request_url = base_url; actual_params_for_requests_lib = None
@@ -75,7 +72,7 @@ class OmeClient:
             query_components = []
             for key, value in params.items():
                 str_value = str(value)
-                safe_chars = "()/:=" if key == '$filter' else "" # Removed ' from safe for $filter
+                safe_chars = "()/:=" if key == '$filter' else ""
                 encoded_value = urllib.parse.quote(str_value, safe=safe_chars)
                 encoded_key = urllib.parse.quote(key, safe="")
                 query_components.append(f"{encoded_key}={encoded_value}")
@@ -250,49 +247,26 @@ class OmeClient:
         return None
 
     def search_ad_group_in_ome_by_name(self, ad_provider_id: int, ad_group_name: str, ad_username: str, ad_password: str) -> Optional[Dict]:
-        """
-        Searches for an AD group by name via OME using a specific AD provider ID and AD credentials.
-        Returns the group info dictionary if found and contains 'ObjectGuid', else None.
-        """
         endpoint_key = 'search_ad_groups_in_ome'
-        if endpoint_key not in constants.API_ENDPOINTS:
-            self.logger.error(f"API endpoint '{endpoint_key}' for AD group search not defined.")
-            return None
-
+        if endpoint_key not in constants.API_ENDPOINTS: self.logger.error(f"API endpoint '{endpoint_key}' missing."); return None
         self.logger.debug(f"Searching AD group '{ad_group_name}' via OME Provider ID {ad_provider_id} using AD creds...")
-        endpoint = constants.API_ENDPOINTS[endpoint_key]
-
+        endpoint = constants.API_ENDPOINTS[endpoint_key];
         payload = {
-            "DirectoryServerId": ad_provider_id,
-            "CommonName": ad_group_name,
-            "Type": constants.AD_SEARCH_TYPE,
-            "UserName": ad_username, # Corrected key
-            "Password": ad_password
+            "DirectoryServerId": ad_provider_id, "CommonName": ad_group_name,
+            "Type": constants.AD_SEARCH_TYPE, "UserName": ad_username, "Password": ad_password
         }
         self.logger.debug(f"Payload for AD Group Search Action ({endpoint}): {payload}")
-
         try:
             response_data = self._send_api_request('POST', endpoint, json_data=payload)
             found_groups: List[Dict] = []
-            if response_data and isinstance(response_data, dict) and 'value' in response_data and isinstance(response_data['value'], list):
-                found_groups = response_data['value']
-            elif response_data and isinstance(response_data, list):
-                found_groups = response_data
-
+            if response_data and isinstance(response_data, dict) and 'value' in response_data and isinstance(response_data['value'], list): found_groups = response_data['value']
+            elif response_data and isinstance(response_data, list): found_groups = response_data
             if found_groups:
                 group_info = found_groups[0]
-                if group_info.get('ObjectGuid'): # Expecting ObjectGuid
-                    self.logger.info(f"Found AD group '{ad_group_name}' with ObjectGuid '{group_info.get('ObjectGuid')}' via OME search.")
-                    return group_info
-                else:
-                    self.logger.error(f"AD group '{ad_group_name}' found via OME search, but 'ObjectGuid' attribute is missing in the response: {group_info}")
-                    return None
-            else:
-                self.logger.warning(f"AD group '{ad_group_name}' not found via OME search using Provider ID {ad_provider_id}.")
-                return None
-        except Exception as e:
-            self.logger.error(f"Error searching AD group '{ad_group_name}' via OME: {e}", exc_info=True)
-            return None
+                if group_info.get('ObjectGuid'): self.logger.info(f"Found AD group '{ad_group_name}' GUID '{group_info.get('ObjectGuid')}' via OME."); return group_info
+                else: self.logger.error(f"AD group '{ad_group_name}' found but missing 'ObjectGuid'."); return None
+            else: self.logger.warning(f"AD group '{ad_group_name}' not found via OME search (Provider ID {ad_provider_id})."); return None
+        except Exception as e: self.logger.error(f"Error searching AD group '{ad_group_name}' via OME: {e}", exc_info=True); return None
 
     def get_role_id_by_name(self, role_name: str) -> Optional[str]:
         endpoint_key = 'roles'
@@ -312,115 +286,77 @@ class OmeClient:
         return None
 
     def import_ad_group(self, ad_provider_id: int, ad_group_name: str, ad_object_guid: str, role_id: str) -> Optional[str]:
-        """
-        Imports an AD group as an OME Account using the detailed payload (list of dict).
-        'role_id' is the OME Role ID (string). 'ad_object_guid' is the AD group's GUID.
-        """
-        endpoint_key = 'import_ad_group' # AccountService.ImportExternalAccountProvider
-        if endpoint_key not in constants.API_ENDPOINTS:
-            self.logger.error(f"API endpoint '{endpoint_key}' for AD group import not defined.")
-            return None
+        endpoint_key = 'import_ad_group'
+        if endpoint_key not in constants.API_ENDPOINTS: self.logger.error(f"API endpoint '{endpoint_key}' missing."); return None
         self.logger.info(f"Importing AD group '{ad_group_name}' (ObjectGuid: {ad_object_guid}, Provider {ad_provider_id}, Role {role_id}) as OME Account...")
-        endpoint = constants.API_ENDPOINTS[endpoint_key]
-
-        # Construct the single dictionary for the group
+        endpoint = constants.API_ENDPOINTS[endpoint_key];
         group_payload_dict = {
-            "UserTypeId": 2,
-            "DirectoryServiceId": ad_provider_id, # OME ID of the AD Provider
-            "Description": ad_group_name,
-            "Name": ad_group_name,
-            "Password": "", # Empty string as per user example
-            "UserName": ad_group_name, # OME Account's username, set to AD group name
-            "RoleId": role_id, # OME Role ID (string, e.g., "10")
-            "Locked": False,
-            "Enabled": True,
-            "ObjectGuid": ad_object_guid # The GUID of the AD group
+            "UserTypeId": 2, "DirectoryServiceId": ad_provider_id, "Description": ad_group_name,
+            "Name": ad_group_name, "Password": "", "UserName": ad_group_name,
+            "RoleId": role_id, "Locked": False, "Enabled": True, "ObjectGuid": ad_object_guid
         }
-        # Wrap the dictionary in a list, as per user's new payload requirement
-        final_payload = [group_payload_dict]
-
+        final_payload = [group_payload_dict] # Payload is a list containing the dict
         self.logger.debug(f"Payload for AD Group Import as Account (action: {endpoint}): {final_payload}")
         try:
-            # The _send_api_request can now handle a list as json_data
-            response_data = self._send_api_request('POST', endpoint, json_data=final_payload) # Action is typically POST
-            
-            # The response for a bulk-like operation (even with one item) might be a list of results,
-            # or a summary, or the ID of the first/only created item. VERIFY THIS.
-            # For now, assume if it's a dict and has 'Id', that's our new account ID.
-            # If it's a list, assume first item is the result.
-            new_account_id_str: Optional[str] = None
-            if isinstance(response_data, list) and response_data:
-                first_result = response_data[0]
-                if isinstance(first_result, dict):
-                    new_id_raw = first_result.get('Id')
-                    if new_id_raw is not None: new_account_id_str = str(new_id_raw).strip()
-            elif isinstance(response_data, dict):
-                 new_id_raw = response_data.get('Id')
-                 if new_id_raw is not None: new_account_id_str = str(new_id_raw).strip()
-            elif isinstance(response_data, (str, int)): # If API returns ID directly
-                 new_account_id_str = str(response_data).strip()
-
-            if new_account_id_str:
-                self.logger.info(f"AD Group '{ad_group_name}' import successful. OME Account ID (or Job ID): {new_account_id_str}")
-                return new_account_id_str
-            
-            self.logger.error(f"AD group import for '{ad_group_name}' failed or no OME Account ID returned from API. Response: {response_data}");
-            return None
-        except Exception as e:
-            self.logger.error(f"Error importing AD group '{ad_group_name}': {e}", exc_info=True); raise e
+            response_data = self._send_api_request('POST', endpoint, json_data=final_payload)
+            if response_data:
+                 new_id_raw = None
+                 if isinstance(response_data, list) and response_data: # If response is a list
+                     first_result = response_data[0]
+                     if isinstance(first_result, dict): new_id_raw = first_result.get('Id')
+                 elif isinstance(response_data, dict): new_id_raw = response_data.get('Id')
+                 elif isinstance(response_data, (str, int)): new_id_raw = str(response_data)
+                 
+                 if new_id_raw is not None and str(new_id_raw).strip(): return str(new_id_raw).strip()
+            self.logger.error(f"AD group import for '{ad_group_name}' failed or no OME Account ID returned."); return None
+        except Exception as e: self.logger.error(f"Error importing AD group '{ad_group_name}': {e}", exc_info=True); raise e
 
     def get_imported_ad_account_by_username(self, ad_group_as_username: str) -> Optional[Dict]:
-        """
-        Searches OME Accounts for an imported AD group by its OME Account UserName.
-        (Replaces get_imported_ad_group_by_guid as GUID might not be filterable post-import)
-        """
-        endpoint_key = 'accounts' # /api/AccountService/Accounts
-        if endpoint_key not in constants.API_ENDPOINTS:
-            self.logger.error(f"API endpoint '{endpoint_key}' for accounts not defined.")
-            return None
-        
+        endpoint_key = 'accounts'
+        if endpoint_key not in constants.API_ENDPOINTS: self.logger.error(f"API endpoint '{endpoint_key}' missing."); return None
         self.logger.debug(f"Searching OME Accounts for UserName '{ad_group_as_username}'...")
-        
-        # Fetch all accounts and iterate, as filtering by ObjectGuid might not be reliable,
-        # and filtering by UserName is a more direct check for the OME account.
         try:
-            response_data = self._send_api_request('GET', constants.API_ENDPOINTS[endpoint_key])
-            if response_data and isinstance(response_data, dict) and 'value' in response_data and isinstance(response_data['value'], list):
-                all_accounts = response_data['value']
-                for account in all_accounts:
-                    # OME account UserName should match the AD group name used during import
-                    if account.get('UserName') == ad_group_as_username:
-                        # Ensure ID is stringified
-                        if 'Id' in account and account['Id'] is not None:
-                            account['Id'] = str(account['Id'])
-                        self.logger.info(f"Found existing OME Account for UserName '{ad_group_as_username}' (Account ID: {account.get('Id')}).")
-                        return account # Return the full account object
-                self.logger.debug(f"No OME Account found with UserName '{ad_group_as_username}'.")
-            elif response_data and isinstance(response_data, list): # If API returns list directly
-                all_accounts = response_data
+            response_data = self._send_api_request('GET', constants.API_ENDPOINTS[endpoint_key]) # Fetch all accounts
+            all_accounts: List[Dict] = []
+            if response_data and isinstance(response_data, dict) and 'value' in response_data and isinstance(response_data['value'], list): all_accounts = response_data['value']
+            elif response_data and isinstance(response_data, list): all_accounts = response_data
+            if all_accounts:
                 for account in all_accounts:
                     if account.get('UserName') == ad_group_as_username:
                         if 'Id' in account and account['Id'] is not None: account['Id'] = str(account['Id'])
-                        self.logger.info(f"Found existing OME Account for UserName '{ad_group_as_username}' (Account ID: {account.get('Id')}).")
+                        self.logger.info(f"Found existing OME Account for UserName '{ad_group_as_username}' (ID: {account.get('Id')}).")
                         return account
                 self.logger.debug(f"No OME Account found with UserName '{ad_group_as_username}'.")
-            else:
-                self.logger.warning(f"Failed to retrieve OME accounts or unexpected response structure when searching for '{ad_group_as_username}'.")
-        except Exception as e:
-            self.logger.error(f"Error retrieving OME accounts to find by UserName '{ad_group_as_username}': {e}", exc_info=True)
+            else: self.logger.warning(f"Failed to retrieve OME accounts or no accounts found when searching for '{ad_group_as_username}'.")
+        except Exception as e: self.logger.error(f"Error retrieving OME accounts to find by UserName '{ad_group_as_username}': {e}", exc_info=True)
         return None
 
-
-    def add_scope_to_ad_group(self, ome_account_id: str, static_group_id: str):
+    def add_scope_to_ad_group(self, ome_account_id: str, static_group_ids: List[str]): # Changed to accept list of IDs
+        """Adds static group(s) (scope) to an OME Account (imported AD group)."""
         endpoint_key = 'add_scope_to_ad_group'
         if endpoint_key not in constants.API_ENDPOINTS: self.logger.error(f"API endpoint '{endpoint_key}' missing."); raise KeyError(f"Endpoint '{endpoint_key}' missing.")
-        self.logger.info(f"Adding static group ID '{static_group_id}' as scope to OME Account ID '{ome_account_id}'...")
+        
+        if not static_group_ids:
+            self.logger.info(f"No static group IDs provided to set scope for OME Account ID '{ome_account_id}'.")
+            return
+
+        self.logger.info(f"Adding static group IDs {static_group_ids} as scope to OME Account ID '{ome_account_id}'...")
         endpoint = constants.API_ENDPOINTS[endpoint_key];
-        payload = {'userid': int(ome_account_id), 'groupid': int(static_group_id)}
+        
+        # Payload uses "UserId" and "Groups" (list of integers)
+        try:
+            payload = {
+                'UserId': int(ome_account_id),
+                'Groups': [int(gid) for gid in static_group_ids]
+            }
+        except ValueError:
+            self.logger.error(f"Invalid AccountID ('{ome_account_id}') or GroupID in list for SetScope. IDs must be integers.")
+            raise ValueError("Invalid ID format for SetScope action.")
+
         self.logger.debug(f"Payload for Add Scope to Account (SetScope action): {payload}")
         try:
             response_data = self._send_api_request('POST', endpoint, json_data=payload)
-            if response_data is None: self.logger.info(f"Add scope request for Account ID {ome_account_id} completed (204 No Content).")
-            elif isinstance(response_data, dict) and 'Id' in response_data: self.logger.info(f"Add scope job created for Account ID {ome_account_id}. Job ID: {response_data['Id']}")
-            else: self.logger.info(f"Add scope request sent for Account ID {ome_account_id}. Response: {str(response_data)[:100]}")
+            if response_data is None: self.logger.info(f"SetScope request for Account ID {ome_account_id} completed (204 No Content).")
+            elif isinstance(response_data, dict) and 'Id' in response_data: self.logger.info(f"SetScope job created for Account ID {ome_account_id}. Job ID: {response_data['Id']}")
+            else: self.logger.info(f"SetScope request sent for Account ID {ome_account_id}. Response: {str(response_data)[:100]}")
         except Exception as e: self.logger.error(f"Error adding scope to OME Account ID {ome_account_id}: {e}", exc_info=True); raise e
