@@ -4,16 +4,15 @@ OME Client module for handling authentication and REST API interactions with
 Dell OpenManage Enterprise. Contains the main OME client class.
 """
 
-# __version__ = "1.10.13" # Previous Version
-__version__ = "1.10.14" # create_static_group uses {"GroupModel":...} payload. Unified find_device_id group membership check.
+# __version__ = "1.10.15" # Previous Version
+__version__ = "1.10.16" # Corrected URL encoding for single quotes in $filter values.
 
 # Modifications:
 # Date       | Version | Author     | Description
 # ---------- | ------- | ---------- | -----------
 # ... (previous history) ...
-# 2025-05-14 | 1.10.13 | Gemini     | Changed create_static_group payload to a flat structure for the CreateGroup action.
-# 2025-05-14 | 1.10.14 | Gemini     | Reverted create_static_group payload to use {"GroupModel": {...}}.
-#                                   | Unified group membership check in find_device_id to use $count=true,$top=0 for all types.
+# 2025-05-14 | 1.10.15 | Gemini     | Changed filter field for 'servicetag' in group membership check back to 'DeviceServiceTag'.
+# 2025-05-14 | 1.10.16 | Gemini     | Modified _send_api_request to ensure single quotes in $filter string literals are percent-encoded (e.g., ' becomes %27).
 
 import requests
 import logging
@@ -62,40 +61,76 @@ class OmeClient:
         except Exception as e: self.logger.error(f"Auth error: {e}"); raise e
 
     def _send_api_request(self, method: str, endpoint: str, json_data: Optional[Dict] = None, params: Optional[Dict] = None) -> Optional[Union[Dict, List, str]]:
+        """
+        Helper method to send API request, ensuring correct URL encoding for GET parameters.
+        Spaces in parameter values will be encoded as %20.
+        Single quotes in $filter string literals will be percent-encoded to %27.
+        """
         if not endpoint.startswith('/'): base_url = f"{self.url}/{endpoint}"
         else: base_url = f"{self.url}{endpoint}"
-        request_url = base_url; actual_params_for_requests_lib = None
+
+        request_url = base_url
+        actual_params_for_requests_lib = None
+
         if method.upper() == 'GET' and params:
+            self.logger.debug(f"Manually encoding GET parameters: {params}")
             query_components = []
             for key, value in params.items():
                 str_value = str(value)
-                safe_chars = "()/:='" if key == '$filter' else ""
-                encoded_value = urllib.parse.quote(str_value, safe=safe_chars)
+                # For $filter values, do NOT mark single quote (') as safe, so it gets encoded to %27.
+                # Other OData characters like parentheses, colon, slash, equals are kept as is.
+                safe_chars_for_value = "()/:=" if key == '$filter' else ""
+                encoded_value = urllib.parse.quote(str_value, safe=safe_chars_for_value)
+                
+                # Keys are generally simple but encode them too for safety.
                 encoded_key = urllib.parse.quote(key, safe="")
                 query_components.append(f"{encoded_key}={encoded_value}")
-            if query_components: request_url = f"{base_url}?{'&'.join(query_components)}"
-            actual_params_for_requests_lib = None; self.logger.debug(f"Manual GET URL: {request_url}")
-        else: actual_params_for_requests_lib = params
+
+            if query_components:
+                request_url = f"{base_url}?{'&'.join(query_components)}"
+            actual_params_for_requests_lib = None # Params are now in URL
+            self.logger.debug(f"Manually constructed GET URL: {request_url}")
+        else:
+            actual_params_for_requests_lib = params
+            if not params: # Only log if params were not already logged by the GET block
+                 self.logger.debug(f"Using requests default parameter handling. URL: {request_url}, Params: {actual_params_for_requests_lib}")
+
         headers = {'Content-Type': 'application/json'}
-        self.logger.debug(f"API Request: {method} {request_url}, Params: {actual_params_for_requests_lib}, Body: {json.dumps(json_data) if json_data else 'None'}")
+        self.logger.debug(f"API Request Final: {method} {request_url}")
+        root_logger = logging.getLogger()
+        if root_logger.isEnabledFor(logging.DEBUG):
+            root_logger.debug(f"Request Headers: {self.session.headers}")
+            if json_data: root_logger.debug(f"Request JSON Body: {json.dumps(json_data)}")
+
         try:
-            response = self.session.request(method, request_url, json=json_data, params=actual_params_for_requests_lib, headers=headers, verify=self.session.verify)
-            self.logger.debug(f"API Response Status: {response.status_code}")
+            response = self.session.request(
+                method,
+                request_url,
+                json=json_data,
+                params=actual_params_for_requests_lib,
+                headers=headers,
+                verify=self.session.verify
+            )
+            self.logger.debug(f"API Response Status: {response.status_code} for {method} {request_url}")
+
             if 200 <= response.status_code < 300:
                 if response.status_code == 204: return None
                 try: return response.json()
-                except json.JSONDecodeError: return response.text
+                except json.JSONDecodeError:
+                    self.logger.warning(f"API call {request_url} status {response.status_code}, body not JSON. Body: {response.text[:200]}...")
+                    return response.text
+            elif response.status_code == 401: raise OmeApiError("Unauthorized", 401, response.text)
+            elif response.status_code == 404: raise OmeApiError("Not Found", 404, response.text)
             else: raise OmeApiError(f"API Error {response.status_code}", response.status_code, response.text)
-        except requests.exceptions.RequestException as e: self.logger.error(f"Connection error: {e}"); raise e
+
+        except requests.exceptions.RequestException as e:
+            self.logger.error(f"Connection error: {e}"); raise e
         except OmeApiError as e: raise e
-        except Exception as e: self.logger.error(f"Unexpected API req error: {e}", exc_info=True); raise e
+        except Exception as e:
+            self.logger.error(f"Unexpected API req error: {e}", exc_info=True); raise e
 
     # --- Static Group Methods ---
     def find_device_id(self, identifier_type: str, identifier_value: str, target_group_id: Optional[str]=None, target_group_name: Optional[str]=None, check_target_group_membership: bool=False) -> Optional[str]:
-        """
-        Finds device ID. If check_target_group_membership is True and target_group_id
-        is provided, first checks if device is already in that specific group using $count=true.
-        """
         search_value=identifier_value; current_identifier_type=identifier_type
         if identifier_type == 'dns-name':
             self.logger.debug(f"Resolving DNS name '{identifier_value}'...")
@@ -109,27 +144,31 @@ class OmeClient:
 
         if check_target_group_membership and target_group_id:
             self.logger.debug(f"Checking if device '{search_value}' ({current_identifier_type}) is in target group '{target_group_name}' (ID: {target_group_id})...")
-            endpoint_key = 'group_devices' # User constant: /Groups({group_id})/AllLeafDevices
+            endpoint_key = 'group_devices'
             if endpoint_key not in constants.API_ENDPOINTS:
                 self.logger.error(f"API endpoint '{endpoint_key}' not defined. Cannot check group membership.")
             else:
                 endpoint=constants.API_ENDPOINTS[endpoint_key].format(group_id=target_group_id)
                 filter_str: Optional[str]=None
-                escaped_val=str(search_value).replace("'","''")
+                # For OData string literals, internal single quotes are doubled.
+                # The surrounding single quotes for the literal will be handled by _send_api_request's encoding.
+                escaped_val_for_odata_literal = str(search_value).replace("'", "''")
                 
                 if current_identifier_type == 'device-ip':
-                    filter_str = f"DeviceManagement/any(a:a/NetworkAddress eq '{escaped_val}')"
+                    # For IP, the value is not typically enclosed in quotes in the DeviceManagement/any filter
+                    filter_str = f"DeviceManagement/any(a:a/NetworkAddress eq '{escaped_val_for_odata_literal}')"
                 elif current_identifier_type == 'servicetag':
-                    # Using 'Identifier' as per user's feedback for this specific endpoint and filter type
-                    filter_str = f"Identifier eq '{escaped_val}'"
+                    # For ServiceTag, it's a string literal
+                    filter_str = f"DeviceServiceTag eq '{escaped_val_for_odata_literal}'"
                 elif current_identifier_type == 'device-id':
-                    filter_str = f"Id eq {escaped_val}" # Assuming Id is numeric or doesn't need quotes
+                    # For DeviceID, if it's numeric, no quotes. If string/GUID, it might need quotes.
+                    # Assuming it's numeric or API handles unquoted GUIDs.
+                    filter_str = f"Id eq {search_value}" # search_value is not escaped_val here if it's numeric
                 else:
                     self.logger.error(f"Unsupported type '{current_identifier_type}' for group membership check.")
 
                 if filter_str:
                     try:
-                        # Unified approach: Use $count=true and $top=0 for all types
                         params_for_group_check = {'$filter': filter_str, '$count': 'true', '$top': '0'}
                         self.logger.debug(f"Group membership check: GET {endpoint} with params {params_for_group_check}")
                         resp = self._send_api_request('GET', endpoint, params=params_for_group_check)
@@ -140,7 +179,7 @@ class OmeClient:
                                 try:
                                     if int(count_val) > 0:
                                         self.logger.info(f"Device '{identifier_value}' ({identifier_type}) already in target group '{target_group_name}'. Skipping.")
-                                        return None # Found in target group
+                                        return None
                                 except (ValueError, TypeError):
                                     self.logger.warning(f"Could not parse @odata.count '{count_val}' as int for group {target_group_id} check.")
                             else:
@@ -154,10 +193,15 @@ class OmeClient:
                     except Exception as e: self.logger.error(f"Error checking group {target_group_id}: {e}. Proceeding.", exc_info=True)
         
         self.logger.debug(f"Device not in target group or check skipped. Performing general search for '{search_value}' ({current_identifier_type})...")
-        filter_str=None; escaped_val=str(search_value).replace("'","''")
-        if current_identifier_type == 'device-ip': filter_str = f"DeviceManagement/any(a:a/NetworkAddress eq '{escaped_val}')"
-        elif current_identifier_type == 'servicetag': filter_str = f"DeviceServiceTag eq '{escaped_val}'" # General search uses DeviceServiceTag
-        elif current_identifier_type == 'device-id': filter_str = f"Id eq {escaped_val}"
+        filter_str=None
+        escaped_val_for_odata_literal = str(search_value).replace("'", "''")
+
+        if current_identifier_type == 'device-ip':
+            filter_str = f"DeviceManagement/any(a:a/NetworkAddress eq '{escaped_val_for_odata_literal}')"
+        elif current_identifier_type == 'servicetag':
+            filter_str = f"DeviceServiceTag eq '{escaped_val_for_odata_literal}'"
+        elif current_identifier_type == 'device-id':
+            filter_str = f"Id eq {search_value}" # Assuming numeric or unquoted GUID
         
         if filter_str:
             try:
@@ -178,7 +222,8 @@ class OmeClient:
         endpoint_key = 'groups'
         if endpoint_key not in constants.API_ENDPOINTS: self.logger.error(f"API endpoint '{endpoint_key}' missing."); return None
         self.logger.debug(f"Searching for group named '{group_name}'...")
-        escaped_name = group_name.replace("'", "''"); filter_str = f"Name eq '{escaped_name}'"
+        escaped_name_for_odata_literal = group_name.replace("'", "''")
+        filter_str = f"Name eq '{escaped_name_for_odata_literal}'"
         try:
             response_data = self._send_api_request('GET', constants.API_ENDPOINTS[endpoint_key], params={'$filter': filter_str, '$top': '1'})
             if response_data and isinstance(response_data, dict) and 'value' in response_data and response_data['value']:
@@ -191,68 +236,32 @@ class OmeClient:
         return None
 
     def create_static_group(self, group_name: str, parent_id: Optional[int] = None) -> Optional[str]:
-        """
-        Creates a new static group in OME using the specified parent ID.
-        Payload is wrapped in {"GroupModel": {...}}.
-        ParentId is required by OME API for this action.
-        """
-        endpoint_key = 'create_group' # User constant: /Actions/GroupService.CreateGroup
-        if endpoint_key not in constants.API_ENDPOINTS:
-            self.logger.error(f"API endpoint '{endpoint_key}' for create_group not defined.")
-            raise KeyError(f"Endpoint '{endpoint_key}' missing.")
-        
-        if parent_id is None:
-            # This should be caught by main.py which resolves "Static Groups" to an ID.
-            # If it still reaches here as None, it's an issue.
-            self.logger.error(f"ParentId is required for creating group '{group_name}'. It cannot be None.")
-            return None
-            
+        endpoint_key = 'create_group'
+        if endpoint_key not in constants.API_ENDPOINTS: self.logger.error(f"API endpoint '{endpoint_key}' missing."); raise KeyError("Endpoint 'create_group' missing.")
+        if parent_id is None: self.logger.error(f"ParentId is required for creating group '{group_name}'."); return None
         self.logger.info(f"Attempting to create static group '{group_name}' under Parent ID: {parent_id}...")
-        
         group_model_payload = {
-            'Name': group_name,
-            'Description': group_name, # Using group_name for description as per user example
+            'Name': group_name, 'Description': group_name,
             'MembershipTypeId': constants.STATIC_GROUP_MEMBERSHIP_TYPE_ID,
-            'ParentId': parent_id # parent_id is now guaranteed to be an int by the caller (main.py)
+            'ParentId': parent_id
         }
-        # Omit Id, GlobalStatus, DefinitionId as they are typically server-assigned for creation.
-
-        # Wrap the group model in the final payload
         final_payload = {"GroupModel": group_model_payload}
-        
         self.logger.debug(f"Payload for creating group (action: {constants.API_ENDPOINTS[endpoint_key]}): {final_payload}")
         try:
             response_data = self._send_api_request('POST', constants.API_ENDPOINTS[endpoint_key], json_data=final_payload)
-            
             if response_data:
-                 # OME CreateGroup action might return GroupId directly or in a nested way.
-                 new_id_raw = None
-                 if isinstance(response_data, dict):
-                     new_id_raw = response_data.get('GroupId', response_data.get('Id'))
-                 elif isinstance(response_data, (str, int)):
-                     new_id_raw = str(response_data)
-                 
-                 if new_id_raw is not None:
-                    new_id_str = str(new_id_raw).strip()
-                    if new_id_str:
-                        self.logger.info(f"Successfully created group '{group_name}' with ID: {new_id_str}.")
-                        return new_id_str
-            self.logger.error(f"Group creation '{group_name}' failed or no ID returned from API. Response: {response_data}")
-            return None
-        except Exception as e:
-            self.logger.error(f"Error creating group '{group_name}': {e}", exc_info=True)
-            raise e
+                 new_id_raw = response_data.get('GroupId', response_data.get('Id')) if isinstance(response_data, dict) else \
+                              (str(response_data) if isinstance(response_data, (str, int)) else None)
+                 if new_id_raw is not None and str(new_id_raw).strip(): return str(new_id_raw).strip()
+            self.logger.error(f"Group creation '{group_name}' failed or no ID returned. Response: {response_data}"); return None
+        except Exception as e: self.logger.error(f"Error creating group '{group_name}': {e}", exc_info=True); raise e
 
     def add_devices_to_group(self, group_id: str, device_ids: List[str]):
         if not device_ids: self.logger.info(f"No devices to add to group {group_id}."); return
         endpoint_key = 'add_devices_to_group'
         if endpoint_key not in constants.API_ENDPOINTS: self.logger.error(f"API endpoint '{endpoint_key}' missing."); raise KeyError(f"Endpoint '{endpoint_key}' missing.")
-        try:
-            payload = { 'GroupId': int(group_id), 'MemberDeviceIds': [int(did) for did in device_ids] }
-        except ValueError:
-            self.logger.error(f"Invalid GroupId ('{group_id}') or DeviceId in list for AddMemberDevices. IDs must be integers.")
-            raise ValueError("Invalid ID format for AddMemberDevices.")
-
+        try: payload = { 'GroupId': int(group_id), 'MemberDeviceIds': [int(did) for did in device_ids] }
+        except ValueError: self.logger.error(f"Invalid GroupId/DeviceId for AddMemberDevices."); raise ValueError("Invalid ID format.")
         self.logger.info(f"Adding {len(device_ids)} devices to group {group_id} via action {constants.API_ENDPOINTS[endpoint_key]}...")
         self.logger.debug(f"Payload for AddMemberDevices: {payload}")
         try:
