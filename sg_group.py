@@ -6,15 +6,15 @@ Main entry point for the OME Static Group Management script.
 Handles argument parsing, orchestrates the workflow, and manages overall script execution.
 """
 
-# __version__ = "1.3.0" # Previous Version
-__version__ = "1.3.1" # Pass logger to utils.parse_devices_input
+# __version__ = "1.3.1" # Previous Version
+__version__ = "1.3.2" # Corrected parent group ID lookup for create_static_group
 
 # Modifications:
 # Date       | Version | Author     | Description
 # ---------- | ------- | ---------- | -----------
 # ...
-# 2025-05-12 | 1.3.0   | Rahul Mehta     | Removed fetching/passing of all_static_groups_map. Pass 'group_existed' flag to find_device_id instead.
-# 2025-05-13 | 1.3.1   | Rahul Mehta     | Updated call to utils.parse_devices_input to pass the logger instance.
+# 2025-05-13 | 1.3.1   | Rahul Mehta    | Updated call to utils.parse_devices_input to pass the logger instance.
+# 2025-05-14 | 1.3.2   | Rahul Mehta    | Modified process_group_task to correctly look up and pass the integer ID of the parent group (including default "Static Groups") to ome_client.create_static_group.
 
 import argparse
 import sys
@@ -23,19 +23,15 @@ import json
 import requests.exceptions
 from typing import Dict, List, Optional, Tuple, Any
 
-import utils # Ensure this is utils v1.0.3 or later
-import constants
+import utils # Ensure this is utils v1.0.4 or later
+import constants # Ensure this is constants_v1_2_0_equiv (internally v1.2.3) or later
 import input_validator
-import ome_client
+import ome_client # Ensure this is ome_client v1.10.12 or later
 import concurrent.futures
 
-# Get logger for this module. This will be configured by utils.setup_logger early in main().
-# This logger instance will be passed to utility functions if they also need to log.
 logger = logging.getLogger(__name__)
 
 def main():
-    """Main function"""
-    # --- Argument Parsing ---
     parser = argparse.ArgumentParser(description="Manage static device groups in OpenManage Enterprise (OME).")
     parser.add_argument('--ome-url', help='OpenManage Enterprise URL', metavar='URL')
     parser.add_argument('--username', help='OME Username', metavar='USERNAME')
@@ -51,41 +47,35 @@ def main():
     parser.add_argument('--log-file', help='Path to a file to write logs to', metavar='LOG_FILE_PATH')
     args = parser.parse_args()
 
-    # --- Setup Logging ---
-    # setup_logger configures the root logger. Functions in other modules
-    # that call logging.getLogger(__name__) will use this configuration.
     utils.setup_logger(debug=args.debug, log_file_path=args.log_file)
     logger.info(f"Static Group Management Script started (Version: {__version__}).")
     logger.debug(f"Parsed arguments: {args}")
 
-    # --- Load Configuration File ---
     config: Optional[Dict] = None
     if args.config:
         logger.info(f"Attempting to load configuration from '{args.config}'...")
-        config = utils.load_config(args.config, logger) # Pass logger for load_config's internal logging
+        config = utils.load_config(args.config, logger)
         if config is None:
             logger.fatal(f"Failed to load or parse configuration file '{args.config}'. Exiting.")
             sys.exit(1)
         logger.info("Configuration file loaded successfully.")
 
-    # --- Collect and Validate OME Credentials ---
     logger.info("Collecting and validating OME credentials...")
     ome_creds, is_ome_creds_valid = utils.collect_and_validate_credentials(
         args, config, constants.OME_AUTH_REQUIRED_KEYS,
         constants.OME_CRED_CONFIG_SECTION, constants.OME_CLI_CRED_MAP,
-        input_validator.validate_ome_credentials_specific, logger # Pass logger
+        input_validator.validate_ome_credentials_specific, logger
     )
     if not is_ome_creds_valid:
         logger.fatal("Invalid OME credentials. Exiting.")
         sys.exit(1)
     logger.info("OME credentials validated.")
 
-    # --- Collect, Parse, Validate, and Segregate Group Definitions ---
     logger.info("Collecting static group definitions...")
     valid_raw_groups, invalid_group_details = utils.collect_and_validate_list_inputs(
         args, config, constants.STATIC_GROUP_CLI_ARG_NAME,
         constants.STATIC_GROUP_CONFIG_SECTION,
-        input_validator.validate_static_group_definition_specific, logger # Pass logger
+        input_validator.validate_static_group_definition_specific, logger
     )
     total_cli_groups = len(getattr(args, constants.STATIC_GROUP_CLI_ARG_NAME, []))
     config_groups_list = utils.get_config_section(config, constants.STATIC_GROUP_CONFIG_SECTION, [])
@@ -98,7 +88,6 @@ def main():
         for item, errors, src_info in invalid_group_details:
             logger.error(f"  Invalid item from {src_info}: {item} -> Errors: {errors}")
 
-    # --- Normalize Valid Group Definitions ---
     normalized_tasks: List[Dict] = []
     logger.debug(f"Normalizing {len(valid_raw_groups)} valid raw group definitions...")
     for raw_group_dict in valid_raw_groups:
@@ -110,8 +99,7 @@ def main():
         }
         if 'devices' in raw_group_dict:
             group_task['identifier_type'] = raw_group_dict.get('identifier_type')
-            # Pass the logger instance to parse_devices_input
-            group_task['devices_raw'] = utils.parse_devices_input(raw_group_dict['devices'], logger) # MODIFIED HERE
+            group_task['devices_raw'] = utils.parse_devices_input(raw_group_dict['devices'], logger)
         else:
             logger.debug(f"No 'devices' key found for group '{group_task.get('group_name', 'Unknown Group')}' during normalization.")
         normalized_tasks.append(group_task)
@@ -120,7 +108,6 @@ def main():
         logger.info("No valid static group tasks to process. Exiting.")
         sys.exit(0)
 
-    # --- OME Authentication ---
     logger.info(f"Connecting to OME at {ome_creds.get('url')}...")
     try:
         ome_client_instance = ome_client.OmeClient(ome_creds['url'], ome_creds['username'], ome_creds['password'])
@@ -130,10 +117,9 @@ def main():
         logger.fatal(f"Failed OME client setup/authentication: {e}", exc_info=args.debug)
         sys.exit(1)
 
-    # --- Process Each Group Task ---
     logger.info("Starting processing of static group tasks...")
     for group_task in normalized_tasks:
-        process_group_task(ome_client_instance, group_task, logger) # Pass logger
+        process_group_task(ome_client_instance, group_task, logger)
 
     logger.info("All static group tasks processed.")
     logger.info("Script finished.")
@@ -141,27 +127,40 @@ def main():
 
 def process_group_task(ome_client_instance: ome_client.OmeClient,
                        group_task: dict,
-                       logger: logging.Logger): # Accept logger
+                       logger: logging.Logger):
     group_name = group_task.get('group_name', 'Unknown Group')
     logger.info(f"--- Processing group '{group_name}' ---")
     logger.debug(f"Task details: {group_task}")
     group_id_to_update: Optional[str] = None
     group_existed_beforehand: bool = False
-    try:
-        parent_group_id: Optional[int] = None
-        parent_group_name = group_task.get('parent_group_name')
-        if parent_group_name and parent_group_name != constants.DEFAULT_PARENT_GROUP:
-            logger.debug(f"Looking for parent group '{parent_group_name}'...")
-            parent_group = ome_client_instance.get_group_by_name(parent_group_name)
-            if parent_group:
-                parent_id_raw = parent_group.get('Id')
-                if parent_id_raw is not None:
-                    try: parent_group_id = int(parent_id_raw)
-                    except (ValueError, TypeError): logger.error(f"Parent group ID '{parent_id_raw}' not valid int. Skipping."); return
-                else: logger.error(f"Parent group '{parent_group_name}' missing ID. Skipping."); return
-            else: logger.error(f"Parent group '{parent_group_name}' not found. Skipping."); return
-        elif parent_group_name == constants.DEFAULT_PARENT_GROUP: parent_group_id = 0
+    
+    # Determine the actual Parent ID to use for creation
+    parent_id_for_creation: Optional[int] = None
+    # parent_group_name will be DEFAULT_PARENT_GROUP if not specified in input, or the user's value
+    parent_group_name_to_find = group_task.get('parent_group_name', constants.DEFAULT_PARENT_GROUP)
 
+    if parent_group_name_to_find: # If a parent name is specified (either default or custom)
+        logger.debug(f"Resolving Parent ID for parent group name: '{parent_group_name_to_find}'")
+        parent_group_obj = ome_client_instance.get_group_by_name(parent_group_name_to_find)
+        if parent_group_obj and parent_group_obj.get('Id') is not None:
+            try:
+                parent_id_for_creation = int(parent_group_obj['Id'])
+                logger.info(f"Found parent group '{parent_group_name_to_find}' with ID: {parent_id_for_creation}.")
+            except (ValueError, TypeError):
+                logger.error(f"ID '{parent_group_obj['Id']}' for parent group '{parent_group_name_to_find}' is not a valid integer. Cannot create child group '{group_name}'.")
+                return # Critical error, cannot proceed with this task
+        else:
+            logger.error(f"Specified parent group '{parent_group_name_to_find}' not found or has no ID. Cannot create child group '{group_name}'.")
+            return # Critical error
+    else:
+        # This case means parent_group_name was explicitly None or empty in the input,
+        # and constants.DEFAULT_PARENT_GROUP was also None/empty (unlikely for "Static Groups").
+        # OME might create at absolute root if ParentId is omitted or 0 in payload.
+        # The ome_client.create_static_group handles None parent_id by potentially using OME's default.
+        logger.warning(f"No parent group name specified for '{group_name}'. Attempting creation at OME default location (likely root or under default 'Static Groups' if client handles it).")
+        parent_id_for_creation = None # Let ome_client handle default if None is passed
+
+    try:
         logger.debug(f"Checking if group '{group_name}' exists...")
         existing_group = ome_client_instance.get_group_by_name(group_name)
         group_existed_beforehand = (existing_group is not None)
@@ -172,9 +171,10 @@ def process_group_task(ome_client_instance: ome_client.OmeClient,
         else:
             logger.info(f"Group '{group_name}' not found.")
             if group_task.get('create', False):
-                logger.info(f"Creating group '{group_name}'...")
+                logger.info(f"Creating group '{group_name}' under parent ID: {parent_id_for_creation} (derived from '{parent_group_name_to_find}').")
                 try:
-                    new_group_id_str = ome_client_instance.create_static_group(group_name, parent_group_id)
+                    # Pass the resolved integer parent_id_for_creation
+                    new_group_id_str = ome_client_instance.create_static_group(group_name, parent_id_for_creation)
                     if new_group_id_str: group_id_to_update = new_group_id_str
                     else: logger.error(f"Group creation '{group_name}' failed to return ID. Skipping."); return
                 except Exception as e: logger.error(f"Failed to create group '{group_name}': {e}. Skipping."); return
@@ -188,7 +188,7 @@ def process_group_task(ome_client_instance: ome_client.OmeClient,
              if identifier_type and raw_devices_list:
                  logger.info(f"Resolving {len(raw_devices_list)} devices ({identifier_type}) for group '{group_name}' (ID: {group_id_to_update}).")
                  resolved_device_ids = resolve_device_identifiers(
-                     ome_client_instance, identifier_type, raw_devices_list, logger, # Pass logger
+                     ome_client_instance, identifier_type, raw_devices_list, logger,
                      target_group_id=group_id_to_update, target_group_name=group_name,
                      group_existed_beforehand=group_existed_beforehand
                  )
@@ -209,7 +209,7 @@ def process_group_task(ome_client_instance: ome_client.OmeClient,
 def resolve_device_identifiers(ome_client_instance: ome_client.OmeClient,
                                identifier_type: str,
                                raw_device_values: list,
-                               logger: logging.Logger, # Accept logger
+                               logger: logging.Logger,
                                target_group_id: Optional[str],
                                target_group_name: Optional[str],
                                group_existed_beforehand: bool
