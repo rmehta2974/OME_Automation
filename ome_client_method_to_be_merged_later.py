@@ -639,6 +639,52 @@ def configure_network_adapter_dns(self, preferred_dns: str, alternate_dns: Optio
         return self.configure_network_adapter(payload_for_post)
     #----------------------------------New code
     
+     # --- AD Provider Configuration ---
+    def configure_ad_provider(self, ad_config_payload: Dict) -> Optional[int]:
+        endpoint = constants.API_ENDPOINTS.get('ad_provider_config', "/api/AccountService/ExternalAccountProvider/ADAccountProvider")
+        provider_name = ad_config_payload.get("Name", "Unknown AD Provider")
+        self.logger.info(f"Configuring AD Provider '{provider_name}'...")
+        try:
+            response = self._send_api_request('POST', endpoint, json_data=ad_config_payload)
+            if response and isinstance(response, dict) and response.get('Id') is not None:
+                provider_id = int(response['Id'])
+                self.logger.info(f"AD Provider '{provider_name}' configured. ID: {provider_id}")
+                return provider_id
+            self.logger.error(f"AD Provider '{provider_name}' config response missing ID. Response: {response}")
+            return None
+        except OmeApiError as e:
+            self.logger.error(f"API error configuring AD Provider '{provider_name}': {e.message}")
+            return None
+        except (ValueError, TypeError) as e:
+            self.logger.error(f"Error parsing Provider ID for '{provider_name}': {e}")
+            return None
+
+    def test_ad_provider_connection(self, test_payload: Dict) -> bool:
+        endpoint = constants.API_ENDPOINTS.get('ad_provider_test_connection', "/api/AccountService/ExternalAccountProvider/Actions/ExternalAccountProvider.TestADConnection")
+        provider_id = test_payload.get("Id", "Unknown")
+        self.logger.info(f"Testing AD connection for Provider ID: {provider_id}...")
+        try:
+            # If successful, _send_api_request will not raise OmeApiError for 2xx codes.
+            # A 204 (None response) or a 200 (potentially with a success body) means test passed.
+            self._send_api_request('POST', endpoint, json_data=test_payload)
+            self.logger.info(f"AD connection test for Provider ID {provider_id} reported success.")
+            return True
+        except OmeApiError as e:
+            self.logger.error(f"AD connection test for Provider ID {provider_id} failed: {e.message}")
+            return False
+
+    # --- NTP Configuration ---
+    def set_ntp_configuration(self, ntp_payload: Dict) -> bool:
+        endpoint = constants.API_ENDPOINTS.get('ntp_config', "/api/ApplicationService/Network/TimeConfiguration")
+        self.logger.info(f"Setting NTP configuration: {ntp_payload}")
+        try:
+            self._send_api_request('PUT', endpoint, json_data=ntp_payload)
+            self.logger.info("NTP configuration updated successfully.")
+            return True
+        except OmeApiError as e:
+            self.logger.error(f"API error setting NTP configuration: {e.message}")
+            return False
+
     # --- DNS Configuration ---
     def get_network_adapter_configurations(self) -> Optional[List[Dict]]:
         endpoint = constants.API_ENDPOINTS.get('get_adapter_configs', "/api/ApplicationService/Network/AdapterConfigurations")
