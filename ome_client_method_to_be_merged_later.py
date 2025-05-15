@@ -536,4 +536,105 @@ class OmeClient:
         except Exception as e:
             self.logger.error(f"Unexpected error setting scope for OME Account ID {ome_account_id}: {e}", exc_info=True)
             raise
+    def get_network_adapter_configurations(self) -> Optional[List[Dict]]:
+        """Gets all network adapter configurations."""
+        # Endpoint: GET /api/ApplicationService/Network/AdapterConfigurations
+        endpoint = constants.API_ENDPOINTS.get('get_adapter_configs', "/api/ApplicationService/Network/AdapterConfigurations")
+        self.logger.info("Fetching network adapter configurations...")
+        try:
+            response = self._send_api_request('GET', endpoint)
+            if isinstance(response, dict) and response.get('@odata.context') and isinstance(response.get('value'), list):
+                return response['value']
+            elif isinstance(response, list): # Non-OData direct list
+                return response
+            self.logger.warning(f"Unexpected response format for adapter configurations: {response}")
+            return None
+        except OmeApiError as e: # Assuming OmeApiError is defined
+            self.logger.error(f"API error fetching adapter configurations: {e.message}")
+            return None
+        except Exception as e:
+            self.logger.error(f"Unexpected error fetching adapter configurations: {e}", exc_info=True)
+            return None
 
+    def configure_network_adapter(self, adapter_config_payload: Dict) -> Tuple[bool, Optional[str]]:
+        """Configures a specific network adapter. Returns (initiated, job_id)."""
+        # Endpoint: /api/ApplicationService/Actions/Network.ConfigureNetworkAdapter (POST)
+        endpoint = constants.API_ENDPOINTS.get('configure_network_adapter_action', "/api/ApplicationService/Actions/Network.ConfigureNetworkAdapter")
+        if_name = adapter_config_payload.get("InterfaceName", "Unknown Interface")
+        self.logger.info(f"Configuring network adapter '{if_name}'...")
+        try:
+            response = self._send_api_request('POST', endpoint, json_data=adapter_config_payload, expected_status_codes=[200, 202]) # 202 if job based
+            if response and isinstance(response, dict) and response.get('Id') is not None: # Job ID
+                job_id = str(response['Id'])
+                self.logger.info(f"Network adapter configuration job for '{if_name}' submitted. Job ID: {job_id}")
+                return True, job_id
+            elif response is None or isinstance(response, dict): 
+                 self.logger.info(f"Network adapter '{if_name}' configuration request accepted (synchronous or no job ID returned).")
+                 return True, None 
+            self.logger.error(f"Network adapter configuration for '{if_name}' response missing Job ID. Response: {response}")
+            return False, None
+        except OmeApiError as e:
+            self.logger.error(f"API error configuring network adapter '{if_name}': {e.message}")
+            return False, None
+        except Exception as e:
+            self.logger.error(f"Unexpected error configuring network adapter '{if_name}': {e}", exc_info=True)
+            return False, None
+
+def configure_network_adapter_dns(self, preferred_dns: str, alternate_dns: Optional[str]) -> Tuple[bool, Optional[str]]:
+        """
+        Helper method to find the primary network adapter, update its DNS settings,
+        and submit the configuration change.
+        Returns: (True if job submission was successful, Job ID if returned, else None)
+        """
+        self.logger.info(f"Attempting to configure DNS on primary adapter. Preferred: {preferred_dns}, Alternate: {alternate_dns or 'None'}")
+        adapters = self.get_network_adapter_configurations()
+        if not adapters:
+            self.logger.error("Could not retrieve network adapter configurations to set DNS.")
+            return False, None
+
+        primary_adapter_config = None
+        for adapter in adapters:
+            if adapter.get("PrimaryInterface") is True: # OME uses "PrimaryInterface": true
+                primary_adapter_config = adapter
+                break
+        
+        if not primary_adapter_config:
+            self.logger.error("No primary network adapter found to configure DNS.")
+            return False, None
+
+        interface_name_for_log = primary_adapter_config.get('InterfaceName', 'UnknownPrimaryInterface')
+        self.logger.info(f"Found primary network adapter: {interface_name_for_log}")
+
+        # Prepare payload for Network.ConfigureNetworkAdapter
+        # Start with the existing primary adapter config and modify it.
+        # Remove @odata.* fields before POSTing back.
+        payload_for_post = {key: value for key, value in primary_adapter_config.items() if not key.startswith('@odata')}
+
+        # Ensure Ipv4Configuration exists
+        if 'Ipv4Configuration' not in payload_for_post or not isinstance(payload_for_post.get('Ipv4Configuration'), dict):
+            payload_for_post['Ipv4Configuration'] = {} # Initialize if missing or not a dict
+        
+        # Modify IPv4 DNS settings
+        payload_for_post['Ipv4Configuration']['UseDHCPForDNSServerNames'] = False
+        payload_for_post['Ipv4Configuration']['StaticPreferredDNSServer'] = preferred_dns
+        payload_for_post['Ipv4Configuration']['StaticAlternateDNSServer'] = alternate_dns if alternate_dns else ""
+
+        # Ensure other required fields for Ipv4Configuration are present if API needs them,
+        # even if just carrying over existing values or defaults.
+        # Example: If EnableDHCP must be explicitly sent.
+        if 'EnableDHCP' not in payload_for_post['Ipv4Configuration']:
+             # If DHCP was true, and we are setting static DNS, we might need to set EnableDHCP to false,
+             # or the API might handle it. For now, just ensure key exists if needed.
+             # payload_for_post['Ipv4Configuration']['EnableDHCP'] = primary_adapter_config.get('Ipv4Configuration',{}).get('EnableDHCP', True) # Carry over
+             pass
+
+
+        # Optionally, ensure 'Enable' for Ipv4Configuration is true if not already
+        if 'Enable' not in payload_for_post['Ipv4Configuration']:
+            payload_for_post['Ipv4Configuration']['Enable'] = True
+
+
+        self.logger.debug(f"Payload for ConfigureNetworkAdapter (DNS update for {interface_name_for_log}): {json.dumps(payload_for_post, indent=2)}")
+        
+        return self.configure_network_adapter(payload_for_post)
+    
