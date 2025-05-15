@@ -1,0 +1,89 @@
+{
+  "OME": {
+    "url": "https://your_ome_ip_or_hostname",
+    "username": "ome_admin_user",
+    "password": "ome_admin_password"
+  },
+  "ActiveDirectory": {
+    "Name": "MyDomainAD",
+    "ServerType": "MANUAL",
+    "ServerName": ["dc1.mydomain.com", "dc2.mydomain.com"],
+    "UserName": "mydomain\\bind_account",
+    "Password": "bind_account_password",
+    "ServerPort": 3268,
+    "GroupDomain": "mydomain.com",
+    "NetworkTimeOut": 60,
+    "SearchTimeOut": 120,
+    "CertificateValidation": false,
+    "CertificateFile": "",
+    "SearchUsername": "mydomain\\search_account", 
+    "SearchPassword": "search_account_password" 
+  },
+  "NTPConfiguration": {
+    "EnableNTP": true,
+    "PrimaryNTPAddress": "ntp.example.com",
+    "SecondaryNTPAddress1": "time.google.com",
+    "SecondaryNTPAddress2": "", 
+    "TimeZone": "America/New_York"
+  },
+  "DNSConfiguration": {
+    "servers": [
+      "192.168.1.1",
+      "8.8.8.8"
+    ]
+  },
+  "CSRConfiguration": {
+    "common_name": "ome.mydomain.com",
+    "organization": "My Company Inc.",
+    "organizational_unit": "IT Department",
+    "locality": "MyCity",
+    "state_or_province": "MyState",
+    "country_code": "US",
+    "email_address": "ome-admin@mydomain.com",
+    "key_size": "4096",
+    "subject_alternative_names_str": "dns:ome-alt.mydomain.com,ip:192.168.1.10"
+  },
+  "PluginActionTasks": [
+    {
+      "Id": "PLUGIN_GUID_1",
+      "Version": "1.2.3",
+      "Action": "Install"
+    },
+    {
+      "Id": "PLUGIN_GUID_2",
+      "Version": "2.0.0",
+      "Action": "Enable"
+    }
+  ],
+  "StaticGroups": [
+    {
+      "group_name": "Production Servers",
+      "description": "All production servers.",
+      "create": true,
+      "parent_group": "All Devices"
+    },
+    {
+      "group_name": "Test Lab Servers",
+      "create": true,
+      "devices": ["file:/opt/ome_scripts/test_server_ips.txt"],
+      "identifier_type": "device-ip"
+    },
+    {
+      "group_name": "Empty Group Example",
+      "description": "Just an empty group created via config.",
+      "create": true
+    }
+  ],
+  "ADImportGroup": [
+    {
+      "group_name": "OME_Admins_Group_From_AD",
+      "role_name": "Administrator",
+      "Scope": ["Production Servers", "Test Lab Servers"]
+    },
+    {
+      "group_name": "OME_Viewers_Group_From_AD",
+      "role_name": "Viewer",
+      "Scope": "Test Lab Servers" 
+    }
+  ]
+}
