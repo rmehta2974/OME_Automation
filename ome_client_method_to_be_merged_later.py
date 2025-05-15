@@ -637,8 +637,10 @@ def configure_network_adapter_dns(self, preferred_dns: str, alternate_dns: Optio
         self.logger.debug(f"Payload for ConfigureNetworkAdapter (DNS update for {interface_name_for_log}): {json.dumps(payload_for_post, indent=2)}")
         
         return self.configure_network_adapter(payload_for_post)
-    -------------------------------------------------New ConnectionAbortedError
-        def get_network_adapter_configurations(self) -> Optional[List[Dict]]:
+    #----------------------------------New code
+    
+    # --- DNS Configuration ---
+    def get_network_adapter_configurations(self) -> Optional[List[Dict]]:
         endpoint = constants.API_ENDPOINTS.get('get_adapter_configs', "/api/ApplicationService/Network/AdapterConfigurations")
         self.logger.info("Fetching network adapter configurations...")
         try:
