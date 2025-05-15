@@ -637,4 +637,106 @@ def configure_network_adapter_dns(self, preferred_dns: str, alternate_dns: Optio
         self.logger.debug(f"Payload for ConfigureNetworkAdapter (DNS update for {interface_name_for_log}): {json.dumps(payload_for_post, indent=2)}")
         
         return self.configure_network_adapter(payload_for_post)
-    
+    -------------------------------------------------New ConnectionAbortedError
+        def get_network_adapter_configurations(self) -> Optional[List[Dict]]:
+        endpoint = constants.API_ENDPOINTS.get('get_adapter_configs', "/api/ApplicationService/Network/AdapterConfigurations")
+        self.logger.info("Fetching network adapter configurations...")
+        try:
+            response = self._send_api_request('GET', endpoint)
+            if isinstance(response, dict) and response.get('@odata.context') and isinstance(response.get('value'), list):
+                return response['value']
+            elif isinstance(response, list): return response
+            self.logger.warning(f"Unexpected response for adapter configurations: {response}")
+            return None
+        except OmeApiError as e:
+            self.logger.error(f"API error fetching adapter configurations: {e.message}")
+            return None
+
+    def configure_network_adapter(self, adapter_config_payload: Dict) -> Tuple[bool, Optional[str]]:
+        endpoint = constants.API_ENDPOINTS.get('configure_network_adapter_action', "/api/ApplicationService/Actions/Network.ConfigureNetworkAdapter")
+        if_name = adapter_config_payload.get("InterfaceName", "Unknown Interface")
+        self.logger.info(f"Configuring network adapter '{if_name}'...")
+        try:
+            response = self._send_api_request('POST', endpoint, json_data=adapter_config_payload)
+            if response and isinstance(response, dict) and response.get('Id') is not None: # Job ID
+                job_id = str(response['Id'])
+                self.logger.info(f"Network adapter config job for '{if_name}' submitted. Job ID: {job_id}")
+                return True, job_id
+            # If API returns 200/204 without job ID for sync success
+            elif response is None or isinstance(response, dict):
+                 self.logger.info(f"Network adapter '{if_name}' config request accepted (sync or no job ID).")
+                 return True, None 
+            self.logger.error(f"Network adapter config for '{if_name}' response missing Job ID. Response: {response}")
+            return False, None
+        except OmeApiError as e:
+            self.logger.error(f"API error configuring network adapter '{if_name}': {e.message}")
+            return False, None
+
+    def configure_network_adapter_dns(self, preferred_dns: str, alternate_dns: Optional[str]) -> Tuple[bool, Optional[str]]:
+        self.logger.info(f"Attempting to configure DNS. Preferred: {preferred_dns}, Alternate: {alternate_dns or 'None'}")
+        adapters = self.get_network_adapter_configurations()
+        if not adapters:
+            self.logger.error("Could not retrieve adapter configs for DNS setup.")
+            return False, None
+        primary_adapter_config = next((adapter for adapter in adapters if adapter.get("PrimaryInterface") is True), None)
+        if not primary_adapter_config:
+            self.logger.error("No primary network adapter found for DNS setup.")
+            return False, None
+        
+        if_name = primary_adapter_config.get('InterfaceName', 'UnknownPrimary')
+        self.logger.info(f"Found primary adapter: {if_name}")
+        payload = {key: value for key, value in primary_adapter_config.items() if not key.startswith('@odata')}
+        if 'Ipv4Configuration' not in payload or not isinstance(payload.get('Ipv4Configuration'), dict):
+            payload['Ipv4Configuration'] = {}
+        
+        payload['Ipv4Configuration']['UseDHCPForDNSServerNames'] = False
+        payload['Ipv4Configuration']['StaticPreferredDNSServer'] = preferred_dns
+        payload['Ipv4Configuration']['StaticAlternateDNSServer'] = alternate_dns if alternate_dns else ""
+        if 'Enable' not in payload['Ipv4Configuration']: payload['Ipv4Configuration']['Enable'] = True
+
+        self.logger.debug(f"Payload for ConfigureNetworkAdapter (DNS for {if_name}): {json.dumps(payload, indent=2)}")
+        return self.configure_network_adapter(payload)
+
+    def get_job_details(self, job_id: Union[str, int]) -> Optional[Dict]:
+        endpoint = constants.API_ENDPOINTS.get('get_job_by_id_simple', f"/api/JobService/Jobs/{job_id}").format(job_id=str(job_id))
+        self.logger.debug(f"Fetching details for Job ID: {job_id}...")
+        try:
+            response = self._send_api_request('GET', endpoint)
+            if isinstance(response, dict) and "Id" in response and (str(response["Id"]) == str(job_id)):
+                return response
+            self.logger.warning(f"Unexpected response or ID mismatch for job {job_id}: {response}")
+            return None
+        except OmeApiError as e:
+            if e.status_code == 404: self.logger.warning(f"Job ID {job_id} not found.")
+            else: self.logger.error(f"API error fetching job {job_id}: {e.message}")
+            return None
+
+    # --- Plugin Configuration ---
+    def update_console_plugins(self, plugins_action_payload: Dict) -> bool:
+        endpoint = constants.API_ENDPOINTS.get('update_plugins_action', "/api/PluginService/Actions/PluginService.UpdateConsolePlugins")
+        self.logger.info(f"Updating console plugins: {json.dumps(plugins_action_payload, indent=2)[:200]}...")
+        try:
+            self._send_api_request('POST', endpoint, json_data=plugins_action_payload)
+            self.logger.info("Plugin update request submitted successfully.")
+            return True # Assuming success if no error. Monitor job if API returns job ID.
+        except OmeApiError as e:
+            self.logger.error(f"API error updating console plugins: {e.message}")
+            return False
+
+    # --- CSR Generation ---
+    def generate_csr(self, csr_payload: Dict) -> Optional[str]:
+        endpoint = constants.API_ENDPOINTS.get('generate_csr_action', "/api/ApplicationService/Actions/ApplicationService.GenerateCSR")
+        self.logger.info(f"Generating CSR with payload: {csr_payload}")
+        try:
+            response = self._send_api_request('POST', endpoint, json_data=csr_payload)
+            if isinstance(response, dict) and isinstance(response.get("CertificateSigningRequest"), str):
+                self.logger.info("CSR generated successfully.")
+                return response["CertificateSigningRequest"]
+            elif isinstance(response, str) and "-----BEGIN CERTIFICATE REQUEST-----" in response: # Raw CSR
+                self.logger.info("CSR generated successfully (raw text response).")
+                return response
+            self.logger.error(f"CSR response missing 'CertificateSigningRequest' string or unexpected format. Response: {response}")
+            return None
+        except OmeApiError as e:
+            self.logger.error(f"API error generating CSR: {e.message}")
+            return None
