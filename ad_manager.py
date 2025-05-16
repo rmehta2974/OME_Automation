@@ -2,25 +2,22 @@
 # -*- coding: utf-8 -*-
 
 """
-OME AD Group Import Manager script (v3.1.10).
+OME AD Group Import Manager script (v3.1.11).
 Imports AD groups via OME provider, assigns roles (with default), adds scope.
-Requires AD credentials for searching groups via OME.
-Checks for existing OME account by UserName before import.
-Handles various scope_name input formats (None, string, list, comma-separated string).
+Uses 'role' and 'scope' as input keys for AD import tasks.
 """
 
-# __version__ = "3.1.9" # Previous version
-__version__ = "3.1.10" # Corrected input_validator function call for AD search credentials.
+# __version__ = "3.1.10" # Previous version
+__version__ = "3.1.11" # Aligned AD import task keys to 'role' and 'scope'.
 
 # Modifications:
 # Date       | Version | Author     | Description
 # ---------- | ------- | ---------- | -----------
 # ... (previous history) ...
-# 2025-05-16 | 3.1.9   | Rahul Mehta     | Removed logger instance passing to utils.setup_logger() and ome_client.OmeClient()
-#            |         |            | constructor based on user feedback about original implementation.
-# 2025-05-15 | 3.1.10  | Rahul Mehta     | Updated call to input_validator to use
+# 2025-05-15 | 3.1.10  | Gemini     | Updated call to input_validator to use
 #            |         |            | validate_ad_search_credentials_and_provider_name_specific
-#            |         |            | to align with input_validator.py v1.2.4.
+# 2025-05-15 | 3.1.11  | Gemini     | Changed AD import task handling to use 'role' and 'scope' keys
+#            |         |            | consistently for normalization and processing.
 
 import argparse
 import sys
@@ -29,8 +26,8 @@ import json
 from typing import Dict, List, Optional, Tuple, Any 
 
 import utils 
-import constants 
-import input_validator 
+import constants # Expecting v1.3.9 or later
+import input_validator # Expecting v1.2.10 or later
 import ome_client 
 
 logger = logging.getLogger(__name__)
@@ -43,7 +40,7 @@ def run_ad_import_workflow(ome_client_instance: ome_client.OmeClient,
                            ad_provider_name_for_logging: str,
                            ad_search_username: str,
                            ad_search_password: str,
-                           normalized_ad_import_tasks: List[Dict],
+                           normalized_ad_import_tasks: List[Dict], # Expects tasks to have 'role' and 'scope' keys
                            logger_instance: logging.Logger) -> bool: 
     logger_instance.info(f"Starting processing of {len(normalized_ad_import_tasks)} AD group import task(s) using AD Provider '{ad_provider_name_for_logging}' (ID: {ad_provider_id})...")
     if not normalized_ad_import_tasks:
@@ -52,22 +49,19 @@ def run_ad_import_workflow(ome_client_instance: ome_client.OmeClient,
 
     overall_success = True
     for import_task in normalized_ad_import_tasks:
-        try:
-            process_ad_import_task(
-                ome_client_instance,
-                ad_provider_id,
-                ad_search_username,
-                ad_search_password,
-                import_task,
-                logger_instance 
-            )
-        except Exception as e:
-            group_name_for_error = import_task.get('group_name', 'Unknown Task')
-            logger_instance.error(f"Unexpected critical error during workflow for AD import task '{group_name_for_error}': {e}", exc_info=True)
-            overall_success = False 
+        # process_ad_import_task now expects 'role' and 'scope' in import_task
+        if not process_ad_import_task(
+            ome_client_instance,
+            ad_provider_id,
+            ad_search_username,
+            ad_search_password,
+            import_task, # This dict should have 'role' and 'scope'
+            logger_instance 
+        ):
+            overall_success = False # Mark if any individual task processing fails
 
     if not overall_success:
-        logger_instance.warning("One or more AD import tasks encountered unexpected critical errors during the workflow.")
+        logger_instance.warning("One or more AD import tasks encountered errors during processing.")
     else:
         logger_instance.info("Finished processing all AD group import tasks.")
     return overall_success
@@ -79,14 +73,16 @@ def process_ad_import_task(ome_client_instance: ome_client.OmeClient,
                            ad_provider_id: int,
                            ad_search_username: str,
                            ad_search_password: str,
-                           import_task: Dict,
-                           logger: logging.Logger): 
+                           import_task: Dict, # Expects 'role' and 'scope' keys
+                           logger: logging.Logger) -> bool: # Return bool for success/failure 
     ad_group_name = import_task.get('group_name')
-    role_name = import_task.get('role_name', constants.DEFAULT_AD_IMPORT_ROLE)
-    raw_scope_input = import_task.get('scope_name')
+    # Use 'role' key from import_task, defaulting to constants.DEFAULT_AD_IMPORT_ROLE
+    role_to_assign = import_task.get('role', constants.DEFAULT_AD_IMPORT_ROLE)
+    # Use 'scope' key from import_task
+    raw_scope_input = import_task.get('scope')
 
     logger.info(f"--- Processing AD group import: '{ad_group_name}' ---")
-    logger.debug(f"Task Details: AD Group='{ad_group_name}', Role='{role_name}', Raw Scope Input='{raw_scope_input or 'None'}'")
+    logger.debug(f"Task Details: AD Group='{ad_group_name}', Role='{role_to_assign}', Scope='{raw_scope_input or 'None'}'")
 
     ad_object_guid: Optional[str] = None
     ome_role_id: Optional[str] = None
@@ -101,17 +97,17 @@ def process_ad_import_task(ome_client_instance: ome_client.OmeClient,
             ad_object_guid = str(ad_group_details['ObjectGuid'])
             logger.info(f"Found AD group '{ad_group_name}' with ObjectGuid: {ad_object_guid}")
         else:
-            logger.error(f"AD group '{ad_group_name}' not found via OME search or ObjectGuid missing. Skipping task.")
-            return
+            logger.error(f"AD group '{ad_group_name}' not found via OME search or ObjectGuid missing. Task failed.")
+            return False # Task failed
 
-        logger.debug(f"Finding OME Role ID for role name '{role_name}'...")
-        ome_role_id_raw = ome_client_instance.get_role_id_by_name(role_name)
+        logger.debug(f"Finding OME Role ID for role name '{role_to_assign}'...")
+        ome_role_id_raw = ome_client_instance.get_role_id_by_name(role_to_assign)
         if ome_role_id_raw:
             ome_role_id = str(ome_role_id_raw)
-            logger.info(f"Found OME Role ID for '{role_name}': {ome_role_id}")
+            logger.info(f"Found OME Role ID for '{role_to_assign}': {ome_role_id}")
         else:
-            logger.error(f"OME Role '{role_name}' not found. Skipping task for AD group '{ad_group_name}'.")
-            return
+            logger.error(f"OME Role '{role_to_assign}' not found. Task failed for AD group '{ad_group_name}'.")
+            return False # Task failed
 
         logger.info(f"Checking if OME Account with UserName '{ad_group_name}' already exists...")
         existing_ome_account = ome_client_instance.get_imported_ad_account_by_username(ad_group_name)
@@ -120,7 +116,7 @@ def process_ad_import_task(ome_client_instance: ome_client.OmeClient,
             if existing_ome_account_id_raw is not None:
                 imported_ome_account_id_str = str(existing_ome_account_id_raw)
                 found_object_guid_on_ome = existing_ome_account.get('ObjectGuid', 'NOT_FOUND_ON_OME_ACCOUNT')
-                logger.warning(f"OME Account with UserName '{ad_group_name}' already exists (ID: {imported_ome_account_id_str}). Its ObjectGuid on OME: '{found_object_guid_on_ome}'. Searched AD group ObjectGuid: '{ad_object_guid}'. Skipping import, will proceed to scope assignment if applicable.")
+                logger.warning(f"OME Account with UserName '{ad_group_name}' already exists (ID: {imported_ome_account_id_str}). Its ObjectGuid on OME: '{found_object_guid_on_ome}'. Searched AD group ObjectGuid: '{ad_object_guid}'. Skipping import, will proceed to scope assignment.")
             else:
                 logger.warning(f"OME Account with UserName '{ad_group_name}' found but its OME Account ID is missing. Attempting fresh import as a precaution.")
         else:
@@ -136,84 +132,63 @@ def process_ad_import_task(ome_client_instance: ome_client.OmeClient,
                     imported_ome_account_id_str = str(import_result_id)
                     logger.info(f"AD group '{ad_group_name}' imported as user. New OME Account ID: {imported_ome_account_id_str}")
                 else:
-                    logger.error(f"AD group import for '{ad_group_name}' failed or returned no OME Account ID. Skipping scope assignment.")
-                    return
-            except Exception as e:
-                logger.error(f"Error during AD group import for '{ad_group_name}': {e}. Skipping scope assignment.", exc_info=logger.isEnabledFor(logging.DEBUG))
-                return
+                    logger.error(f"AD group import for '{ad_group_name}' failed or returned no OME Account ID. Task failed.")
+                    return False # Task failed
+            except Exception as e: 
+                logger.error(f"Error during AD group import for '{ad_group_name}': {e}. Task failed.", exc_info=logger.isEnabledFor(logging.DEBUG))
+                return False # Task failed
 
+        # Scope handling
         individual_scope_names_to_process: List[str] = []
         if isinstance(raw_scope_input, list):
             for item in raw_scope_input:
-                if isinstance(item, str):
-                    item_stripped = item.strip()
-                    if item_stripped:
-                        individual_scope_names_to_process.append(item_stripped)
-                    else:
-                        logger.warning(f"Empty scope name found in list for AD group '{ad_group_name}'. Skipping it.")
-                else:
-                    logger.warning(f"Non-string item '{item}' in scope list for AD group '{ad_group_name}'. Skipping it.")
-        elif isinstance(raw_scope_input, str):
-            raw_scope_input_stripped = raw_scope_input.strip()
-            if not raw_scope_input_stripped:
-                logger.info(f"Scope input for AD group '{ad_group_name}' is an empty string. No specific scopes to process by name.")
-            elif ',' in raw_scope_input_stripped:
-                names = [s.strip() for s in raw_scope_input_stripped.split(',') if s.strip()]
-                if names:
-                    individual_scope_names_to_process.extend(names)
-                else:
-                    logger.warning(f"Comma-separated scope string '{raw_scope_input_stripped}' for AD group '{ad_group_name}' resulted in no valid scope names after parsing.")
+                if isinstance(item, str) and item.strip():
+                    individual_scope_names_to_process.append(item.strip())
+        elif isinstance(raw_scope_input, str) and raw_scope_input.strip():
+            if ',' in raw_scope_input:
+                individual_scope_names_to_process.extend([s.strip() for s in raw_scope_input.split(',') if s.strip()])
             else:
-                individual_scope_names_to_process.append(raw_scope_input_stripped)
-        elif raw_scope_input is not None:
-            logger.warning(f"Unexpected type for scope_name: {type(raw_scope_input)} for AD group '{ad_group_name}'. Attempting to treat as string.")
-            try:
-                fallback_str_scope = str(raw_scope_input).strip()
-                if fallback_str_scope:
-                    if ',' in fallback_str_scope:
-                        names = [s.strip() for s in fallback_str_scope.split(',') if s.strip()]
-                        if names: individual_scope_names_to_process.extend(names)
-                    else:
-                        individual_scope_names_to_process.append(fallback_str_scope)
-                else:
-                    logger.warning(f"Fallback conversion of scope value '{raw_scope_input}' for AD group '{ad_group_name}' resulted in an empty string.")
-            except Exception as e:
-                logger.error(f"Could not convert unexpected scope type '{type(raw_scope_input)}' to string for AD group '{ad_group_name}': {e}")
-
-        if imported_ome_account_id_str and raw_scope_input is not None:
-            logger.info(f"Attempting to set scopes for OME Account ID: {imported_ome_account_id_str} (AD Group: '{ad_group_name}') based on requested scope name(s).")
-            collected_scope_group_ids_as_str: List[str] = []
+                individual_scope_names_to_process.append(raw_scope_input.strip())
+        
+        if imported_ome_account_id_str and raw_scope_input is not None: # If scope was intended
             if individual_scope_names_to_process:
+                collected_scope_group_ids_as_str: List[str] = []
                 for s_name_to_find in individual_scope_names_to_process:
-                    logger.debug(f"Searching for OME static group (scope) '{s_name_to_find}' to get its ID...")
                     scope_group_details = ome_client_instance.get_group_by_name(s_name_to_find)
                     if scope_group_details and scope_group_details.get('Id') is not None:
                         scope_group_id_str = str(scope_group_details.get('Id'))
                         if scope_group_id_str.strip():
                             collected_scope_group_ids_as_str.append(scope_group_id_str)
-                            logger.info(f"Found OME static group (scope) '{s_name_to_find}' with ID: {scope_group_id_str}.")
+                            logger.info(f"Found scope group '{s_name_to_find}' (ID: {scope_group_id_str}) for AD group '{ad_group_name}'.")
                         else:
-                            logger.warning(f"OME static group (scope) '{s_name_to_find}' found but its ID is empty. Skipping this scope.")
+                            logger.warning(f"Scope group '{s_name_to_find}' for AD group '{ad_group_name}' found but its ID is empty.")
                     else:
-                        logger.warning(f"OME static group (scope) ('{s_name_to_find}') not found or its ID is missing. This scope will not be included.")
-            try:
-                logger.info(f"Calling 'add_scope_to_ad_group' for OME Account ID {imported_ome_account_id_str} with resolved static group IDs: {collected_scope_group_ids_as_str}")
-                ome_client_instance.add_scope_to_ad_group(
-                    imported_ome_account_id_str, 
-                    collected_scope_group_ids_as_str  
-                ) 
-                logger.info(f"Call to 'add_scope_to_ad_group' completed for OME Account ID {imported_ome_account_id_str}.")
-            except Exception as e:
-                logger.error(f"Error occurred during the call to 'add_scope_to_ad_group' for OME Account ID {imported_ome_account_id_str}: {e}", exc_info=logger.isEnabledFor(logging.DEBUG))
-        elif imported_ome_account_id_str and raw_scope_input is None:
-            logger.info(f"No 'scope_name' provided in the import task for AD group '{ad_group_name}' (OME Account ID: {imported_ome_account_id_str}). Existing scopes will remain unchanged.")
-        elif not imported_ome_account_id_str and raw_scope_input is not None:
-            logger.warning(f"Cannot process scopes (input: '{raw_scope_input}') because OME Account ID for AD group '{ad_group_name}' could not be determined.")
+                        logger.warning(f"Scope group ('{s_name_to_find}') for AD group '{ad_group_name}' not found or its ID is missing.")
+                
+                try:
+                    logger.info(f"Setting/updating scopes for OME Account ID {imported_ome_account_id_str} to group IDs: {collected_scope_group_ids_as_str}")
+                    ome_client_instance.add_scope_to_ad_group(imported_ome_account_id_str, collected_scope_group_ids_as_str)
+                    logger.info(f"Call to set scopes for OME Account ID {imported_ome_account_id_str} completed.")
+                except Exception as e:
+                    logger.error(f"Error setting scopes for OME Account '{imported_ome_account_id_str}': {e}", exc_info=logger.isEnabledFor(logging.DEBUG))
+                    # Decide if scope failure means task failure. For now, just logging.
+            else: # raw_scope_input was provided but parsed to nothing (e.g. empty string, or list of empty strings)
+                logger.info(f"Scope input for '{ad_group_name}' was present but yielded no valid scope names. To clear scopes, provide an empty list to the OME API if supported by add_scope_to_ad_group, or ensure input is truly empty/None if no change is desired.")
+                # If intent is to clear scopes, call with empty list:
+                # ome_client_instance.add_scope_to_ad_group(imported_ome_account_id_str, [])
 
-    except Exception as e:
+        elif imported_ome_account_id_str and raw_scope_input is None:
+            logger.info(f"No 'scope' provided in the import task for AD group '{ad_group_name}'. Existing scopes will remain unchanged.")
+        
+        logger.info(f"--- Successfully processed AD group import for '{ad_group_name}' ---")
+        return True # Task succeeded
+
+    except Exception as e: 
         logger.error(f"Unexpected error processing task for AD group '{ad_group_name}': {e}", exc_info=True)
-    finally:
-        logger.info(f"--- Finished processing AD group import for '{ad_group_name}' ---")
+        return False # Task failed
+    # finally: # Removed finally block as return statements handle exit
+        # logger.info(f"--- Finished processing AD group import for '{ad_group_name}' ---")
+
 
 #------------------------------------------------------------------------------
 # Main execution block
@@ -224,9 +199,9 @@ def main():
         formatter_class=argparse.ArgumentDefaultsHelpFormatter
     )
     grp_ome = parser.add_argument_group('OME Connection Details')
-    grp_ome.add_argument('--ome-url', metavar='URL', help="URL for the OME instance (e.g., https://ome.example.com)")
-    grp_ome.add_argument('--username', metavar='USER', help="OME username for authentication")
-    grp_ome.add_argument('--password', metavar='PASS', help="OME password for authentication")
+    grp_ome.add_argument('--ome-url', metavar='URL')
+    grp_ome.add_argument('--username', metavar='USER')
+    grp_ome.add_argument('--password', metavar='PASS')
 
     grp_ad = parser.add_argument_group('AD Provider & Credentials')
     grp_ad.add_argument('--ad-name', dest='ad_name', help="Name of the pre-configured AD provider in OME", metavar='PROVIDER_NAME')
@@ -234,22 +209,21 @@ def main():
     grp_ad.add_argument('--ad-password', dest='ad_password', help="Password for AD (for searching groups via OME)", metavar='AD_PASS')
 
     grp_input = parser.add_argument_group('Input Sources for AD Group Import Tasks')
-    grp_input.add_argument('--config', help='Path to JSON config file containing connection details and/or import tasks', metavar='FILE_PATH')
+    grp_input.add_argument('--config', help='Path to JSON config file', metavar='FILE_PATH')
+    # Help text updated for 'role' and 'scope'
     ad_group_task_help = (
-        f"JSON string for a single AD import task. Keys: 'group_name' (required), "
-        f"'role_name' (optional, default: {constants.DEFAULT_AD_IMPORT_ROLE}), "
-        f"'scope_name' (optional, can be string or list of strings). Can be used multiple times."
+        f"JSON for AD import task. Keys: 'group_name' (req), 'role' (opt, def: {constants.DEFAULT_AD_IMPORT_ROLE}), 'scope' (opt, string or list of strings)."
     )
     grp_input.add_argument(
-        f'--{constants.AD_IMPORT_GROUP_CLI_ARG_NAME}', # Should be 'adgroup'
+        f'--{constants.AD_IMPORT_GROUP_CLI_ARG_NAME}', # 'adgroup'
         action='append',
         help=ad_group_task_help,
         metavar='JSON_STRING'
     )
 
     grp_log = parser.add_argument_group('Logging Options')
-    grp_log.add_argument('--debug', action='store_true', help="Enable debug level logging")
-    grp_log.add_argument('--log-file', metavar='LOG_FILE_PATH', help="Path to a file for logging output")
+    grp_log.add_argument('--debug', action='store_true')
+    grp_log.add_argument('--log-file', metavar='LOG_FILE_PATH')
     args = parser.parse_args()
 
     utils.setup_logger(debug=args.debug, log_file_path=args.log_file)
@@ -260,7 +234,7 @@ def main():
     if args.config:
         config = utils.load_config(args.config, logger)
         if config is None:
-            logger.fatal(f"Failed to load configuration from '{args.config}'. Exiting.")
+            logger.fatal(f"Failed config load from '{args.config}'. Exiting.")
             sys.exit(1)
 
     ome_creds, is_ome_creds_valid = utils.collect_and_validate_credentials(
@@ -274,14 +248,13 @@ def main():
 
     ome_client_instance: Optional[ome_client.OmeClient] = None
     try:
-        logger.debug(f"Initializing OME client for URL: {ome_creds.get('url')}")
         ome_client_instance = ome_client.OmeClient(
             ome_creds['url'], ome_creds['username'], ome_creds['password']
         )
         ome_client_instance.authenticate()
         logger.info("Successfully authenticated with OME.")
     except Exception as e:
-        logger.fatal(f"Failed OME client setup or authentication: {e}", exc_info=args.debug)
+        logger.fatal(f"Failed OME client setup/auth: {e}", exc_info=args.debug)
         sys.exit(1)
 
     ad_provider_id: Optional[int] = None
@@ -289,15 +262,12 @@ def main():
     ad_search_username_val: Optional[str] = None
     ad_search_password_val: Optional[str] = None
     try:
-        # This collects AD Provider Name and AD Search Credentials
         ad_config_data, is_ad_config_valid = utils.collect_and_validate_credentials(
             args, config,
-            # Required keys for this operation: AD Provider Name + AD Search Username/Password
             constants.AD_PROVIDER_REQUIRED_KEYS_FOR_FIND.union(constants.AD_CRED_REQUIRED_KEYS),
-            constants.AD_CONFIG_SECTION, # 'ActiveDirectory'
-            constants.AD_CONFIG_CLI_MAP, # Maps --ad-name, --ad-username, --ad-password
-            # Use the validator that checks for Name, Username, and Password
-            input_validator.validate_ad_search_credentials_and_provider_name_specific, # CORRECTED VALIDATOR
+            constants.AD_CONFIG_SECTION, 
+            constants.AD_CONFIG_CLI_MAP, 
+            input_validator.validate_ad_search_credentials_and_provider_name_specific, 
             logger
         )
         if not is_ad_config_valid:
@@ -305,37 +275,37 @@ def main():
             sys.exit(1)
 
         ad_provider_name_for_logging = ad_config_data.get('Name')
-        ad_search_username_val = ad_config_data.get('Username')
+        ad_search_username_val = ad_config_data.get('UserName') # Changed from Username to UserName
         ad_search_password_val = ad_config_data.get('Password')
         
         if not ad_provider_name_for_logging: 
-            logger.fatal("AD Provider Name is missing after validation. Cannot proceed. Exiting.")
+            logger.fatal("AD Provider Name missing. Exiting.")
             sys.exit(1)
         if ad_search_username_val is None or ad_search_password_val is None: 
-             logger.fatal("AD search username or password missing after validation. Exiting.")
+             logger.fatal("AD search username or password missing. Exiting.")
              sys.exit(1)
 
         logger.info(f"Finding OME ID for AD Provider '{ad_provider_name_for_logging}'...")
         ad_provider_id_raw = ome_client_instance.get_ad_provider_id_by_name(ad_provider_name_for_logging)
         if ad_provider_id_raw is None:
-            logger.fatal(f"AD Provider '{ad_provider_name_for_logging}' not found or has no ID in OME. Exiting.")
+            logger.fatal(f"AD Provider '{ad_provider_name_for_logging}' not found or no ID. Exiting.")
             sys.exit(1)
         try:
             ad_provider_id = int(ad_provider_id_raw)
         except ValueError:
-            logger.fatal(f"AD Provider ID '{ad_provider_id_raw}' for '{ad_provider_name_for_logging}' is not a valid integer. Exiting.")
+            logger.fatal(f"AD Provider ID '{ad_provider_id_raw}' for '{ad_provider_name_for_logging}' not valid int. Exiting.")
             sys.exit(1)
         logger.info(f"Using AD Provider ID: {ad_provider_id} for '{ad_provider_name_for_logging}'.")
 
     except Exception as e:
-        logger.fatal(f"Error handling AD provider configuration or credentials: {e}", exc_info=args.debug)
+        logger.fatal(f"Error handling AD provider/credentials: {e}", exc_info=args.debug)
         sys.exit(1)
 
     valid_raw_ad_imports, invalid_ad_import_details = utils.collect_and_validate_list_inputs(
         args, config,
-        constants.AD_IMPORT_GROUP_CLI_ARG_NAME, # 'adgroup'
-        constants.AD_IMPORT_GROUP_CONFIG_SECTION, # 'ADImportGroup'
-        input_validator.validate_ad_import_task_specific,
+        constants.AD_IMPORT_GROUP_CLI_ARG_NAME, 
+        constants.AD_IMPORT_GROUP_CONFIG_SECTION, 
+        input_validator.validate_ad_import_task_specific, # This validator now expects 'role' and 'scope'
         logger
     )
     
@@ -344,9 +314,9 @@ def main():
     config_ad_tasks_list = utils.get_config_section(config, constants.AD_IMPORT_GROUP_CONFIG_SECTION, [])
     total_config_tasks = len(config_ad_tasks_list) if isinstance(config_ad_tasks_list, list) else 0
     
-    if (total_cli_tasks + total_config_tasks) == 0: # No tasks provided at all
-        logger.info("No AD import tasks defined in CLI arguments or config file. Nothing to do for AD import.")
-    elif (total_cli_tasks + total_config_tasks) == 1 and not valid_raw_ad_imports: # Single task provided and it's invalid
+    if (total_cli_tasks + total_config_tasks) == 0:
+        logger.info("No AD import tasks defined. Nothing to do for AD import.")
+    elif (total_cli_tasks + total_config_tasks) == 1 and not valid_raw_ad_imports:
         logger.fatal("Single AD import task provided, and it is invalid. Exiting.")
         sys.exit(1)
 
@@ -358,43 +328,39 @@ def main():
     normalized_ad_import_tasks: List[Dict] = []
     for raw_task_dict in valid_raw_ad_imports:
         group_name = raw_task_dict['group_name'] 
-        role = raw_task_dict.get('role') or constants.DEFAULT_AD_IMPORT_ROLE
-        if not raw_task_dict.get('role'):
-            logger.debug(f"Using default role '{role}' for AD group '{group_name}'.")
+        # Normalize to 'role' and 'scope' for process_ad_import_task
+        role_val = raw_task_dict.get('role', constants.DEFAULT_AD_IMPORT_ROLE) # Get 'role'
+        if 'role' not in raw_task_dict: # Log if default was applied because key was missing
+            logger.debug(f"Using default role '{role_val}' for group '{group_name}' as 'role' key was not specified.")
         
-        # Use 'Scope' from input task as per constants.AD_IMPORT_TASK_OPTIONAL_KEYS
-        # process_ad_import_task expects 'scope_name' in its input dict.
-        current_scope_val = raw_task_dict.get('scope') 
+        scope_val = raw_task_dict.get('scope') # Get 'scope'
         
         normalized_task = {
             "group_name": group_name,
-            "role_name": role,
-            "scope_name": current_scope_val # Pass the value of 'Scope' as 'scope_name'
+            "role": role_val,    # Store as 'role'
+            "scope": scope_val   # Store as 'scope'
         }
         normalized_ad_import_tasks.append(normalized_task)
         logger.debug(f"Normalized AD import task: {normalized_task}")
 
-    if not normalized_ad_import_tasks and (total_cli_tasks + total_config_tasks) > 0 : # Had inputs, but none were valid
+    if not normalized_ad_import_tasks and (total_cli_tasks + total_config_tasks) > 0 :
         logger.warning("No valid AD import tasks to process after validation. Exiting.")
         sys.exit(0) 
-    elif not normalized_ad_import_tasks: # No inputs and no valid tasks (already logged above if no tasks defined)
-        pass # Proceed to logout if no tasks were ever defined or processed
-
+    
     exit_code = 0
-    if normalized_ad_import_tasks: # Only run workflow if there are tasks
+    if normalized_ad_import_tasks: 
         try:
             workflow_success = run_ad_import_workflow(
                 ome_client_instance,
-                ad_provider_id, # type: ignore 
-                ad_provider_name_for_logging, # type: ignore
-                ad_search_username_val, # type: ignore
-                ad_search_password_val, # type: ignore
+                ad_provider_id, 
+                ad_provider_name_for_logging, 
+                ad_search_username_val, 
+                ad_search_password_val, 
                 normalized_ad_import_tasks,
                 logger
             )
             if not workflow_success:
                 logger.warning("AD import workflow completed with one or more task-level errors.")
-                # exit_code = 1 # Optionally set exit code if any task fails
         except Exception as e:
             logger.fatal(f"Core AD import workflow failed unexpectedly: {e}", exc_info=True)
             exit_code = 1
