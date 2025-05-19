@@ -788,3 +788,95 @@ def configure_network_adapter_dns(self, preferred_dns: str, alternate_dns: Optio
         except OmeApiError as e:
             self.logger.error(f"API error generating CSR: {e.message}")
             return None
+#----------------------------------
+
+ # --- Plugin Configuration ---
+    def get_plugin_details(self, plugin_id: Optional[str] = None, plugin_name: Optional[str] = None) -> Optional[List[Dict]]:
+        endpoint = constants.API_ENDPOINTS.get('get_plugins', '/api/PluginService/Plugins')
+        params = {}
+        log_msg = "Fetching all plugin details"
+        if plugin_id: params['$filter'] = f"Id eq '{plugin_id}'"; log_msg = f"Fetching plugin details for ID '{plugin_id}'"
+        elif plugin_name: params['$filter'] = f"Name eq '{plugin_name}'"; log_msg = f"Fetching plugin details for Name '{plugin_name}'"
+        self.logger.info(log_msg + "...")
+        try:
+            response_data = self._send_api_request('GET', endpoint, params=params if params else None)
+            if response_data and isinstance(response_data, dict) and 'value' in response_data and isinstance(response_data['value'], list):
+                self.logger.debug(f"Found {len(response_data['value'])} plugins matching query.")
+                return response_data['value']
+            elif response_data and isinstance(response_data, list): 
+                self.logger.debug(f"Found {len(response_data)} plugins matching query (direct list).")
+                return response_data
+            self.logger.warning(f"No plugins found or unexpected response format for plugin details. Response: {response_data}")
+            return [] 
+        except OmeApiError as e: self.logger.error(f"API error fetching plugin details: {str(e)}"); return None
+        except Exception as e: self.logger.error(f"Unexpected error fetching plugin details: {e}", exc_info=True); return None
+
+    def get_plugin_available_versions(self, plugin_id: str) -> Optional[List[Dict]]:
+        """
+        Retrieves available versions for a specific plugin.
+        Endpoint: GET /api/PluginService/Plugins('{plugin_id}')/AvailableVersionDetails
+        """
+        endpoint_template = constants.API_ENDPOINTS.get('get_plugin_available_versions')
+        if not endpoint_template:
+            self.logger.error("Endpoint 'get_plugin_available_versions' not defined in constants.")
+            return None
+        
+        # OData key syntax for plugin_id often requires single quotes if it's a string (like GUID)
+        # Ensure plugin_id is properly formatted for the URL if it's not already.
+        # The constant already has '{plugin_id}' so .format should work.
+        # If plugin_id needs to be quoted in the URL: endpoint_path = endpoint_template.format(plugin_id=f"'{plugin_id}'")
+        endpoint_path = endpoint_template.format(plugin_id=plugin_id) 
+                                                
+        self.logger.info(f"Fetching available versions for plugin ID '{plugin_id}' from {endpoint_path}...")
+        try:
+            response_data = self._send_api_request('GET', endpoint_path)
+            # Expected response: {"@odata.context": "...", "@odata.count": N, "value": [{"Version": "...", "Description": ...}]}
+            if response_data and isinstance(response_data, dict) and "value" in response_data and isinstance(response_data["value"], list):
+                versions = response_data["value"]
+                self.logger.info(f"Found {len(versions)} available versions for plugin {plugin_id}.")
+                self.logger.debug(f"Available versions details: {versions}")
+                return versions # List of dicts, each with "Version", "Description" etc.
+            else:
+                self.logger.warning(f"No available versions found or unexpected response format for plugin {plugin_id}. Response: {response_data}")
+                return [] # Return empty list if no versions or bad format
+        except OmeApiError as e:
+            self.logger.error(f"API error fetching available versions for plugin {plugin_id}: {str(e)}")
+            return None
+        except Exception as e:
+            self.logger.error(f"Unexpected error fetching available versions for plugin {plugin_id}: {e}", exc_info=True)
+            return None
+
+    def check_plugin_compatibility(self, ome_version: str, plugin_id: str, plugin_version: str) -> Tuple[bool, str]:
+        endpoint = constants.API_ENDPOINTS.get('check_plugin_compatibility', "/api/PluginService/Actions/PluginService.CheckPluginCompatibility")
+        payload = {
+            "OmeVersion": ome_version,
+            "Plugins": [{"Id": plugin_id, "Version": plugin_version}]
+        }
+        self.logger.info(f"Checking compatibility for plugin ID '{plugin_id}' v{plugin_version} against OME v{ome_version}...")
+        self.logger.debug(f"Compatibility check payload: {payload}")
+        try:
+            response = self._send_api_request('POST', endpoint, json_data=payload)
+            if response and isinstance(response, dict) and "Plugins" in response and isinstance(response["Plugins"], list) and response["Plugins"]:
+                plugin_compat_info = response["Plugins"][0]
+                if plugin_compat_info.get("Id") == plugin_id:
+                    is_compatible = plugin_compat_info.get("Compatible", False) 
+                    message = f"Plugin {plugin_id} v{plugin_version} compatibility: {is_compatible}."
+                    if not is_compatible: message += f" Reason: {plugin_compat_info.get('CompatibilityMessage', 'No specific reason provided by API.')}"
+                    self.logger.info(message)
+                    return is_compatible, message
+                else:
+                    msg = f"Compatibility response for wrong plugin ID. Expected {plugin_id}, got {plugin_compat_info.get('Id')}."
+                    self.logger.warning(msg); return False, msg 
+            self.logger.warning(f"Could not determine compatibility for {plugin_id} v{plugin_version}. Response: {response}")
+            return False, "Compatibility status unknown from response." 
+        except OmeApiError as e: self.logger.error(f"API error during plugin compatibility check for {plugin_id} v{plugin_version}: {str(e)}"); return False, f"API error: {str(e)}."
+        except Exception as e: self.logger.error(f"Unexpected error during plugin compatibility check for {plugin_id} v{plugin_version}: {e}", exc_info=True); return False, f"Unexpected error: {e}."
+
+    def update_console_plugins(self, plugins_action_payload: Dict) -> bool:
+        endpoint = constants.API_ENDPOINTS.get('update_plugins_action', "/api/PluginService/Actions/PluginService.UpdateConsolePlugins")
+        self.logger.info(f"Updating console plugins: {json.dumps(plugins_action_payload, indent=2)[:200]}...")
+        try:
+            self._send_api_request('POST', endpoint, json_data=plugins_action_payload)
+            self.logger.info("Plugin update request submitted successfully.")
+            return True 
+        except OmeApiError as e: self.logger.error(f"API error updating console plugins: {str(e)}"); return False

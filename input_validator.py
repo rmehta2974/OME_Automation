@@ -8,9 +8,9 @@ __version__ = "1.2.11" # Renamed and updated NTP validator to use direct API key
 # Date       | Version | Author     | Description
 # ---------- | ------- | ---------- | -----------
 # ... (previous history) ...
-# 2025-05-15 | 1.2.10  | Gemini     | Updated validate_ad_import_task_specific to use 'role' and 'scope'
+# 2025-05-15 | 1.2.10  | Rahul Mehta     | Updated validate_ad_import_task_specific to use 'role' and 'scope'
 #            |         |            | as optional keys, aligning with constants v1.3.9.
-# 2025-05-15 | 1.2.11  | Gemini     | Renamed validate_ntp_user_input_specific to
+# 2025-05-15 | 1.2.11  | Rahul Mehta     | Renamed validate_ntp_user_input_specific to
 #            |         |            | validate_ntp_config_payload_specific and updated it to validate
 #            |         |            | direct API keys for NTP config, aligning with constants v1.3.10.
 
@@ -313,6 +313,22 @@ def validate_csr_user_input_specific(input_dict: Dict, source_info: str) -> Tupl
                  errors.append("Optional 'subject_alternative_names_str' must be a string."); final_is_valid = False
     return final_is_valid, errors
 
+def validate_plugin_action_task_specific(task_dict: Dict, source_info: str) -> Tuple[bool, List[str]]:
+    context_name = f"Plugin Action Task from {source_info}"
+    logger.debug(f"Validating {context_name}...")
+    is_struct_valid, errors = validate_input(
+        task_dict, constants.PLUGIN_ACTION_TASK_REQUIRED_KEYS, context_name=context_name
+    )
+    final_is_valid = is_struct_valid
+    if is_struct_valid:
+        if not isinstance(task_dict.get('Id'), str) or not task_dict.get('Id','').strip():
+            errors.append("'Id' (plugin GUID) must be a non-empty string."); final_is_valid = False
+        if not isinstance(task_dict.get('Version'), str) or not task_dict.get('Version','').strip():
+            errors.append("'Version' must be a non-empty string."); final_is_valid = False
+        action = task_dict.get('Action')
+        if not isinstance(action, str) or action not in constants.VALID_PLUGIN_ACTIONS:
+            errors.append(f"'Action' ('{action}') is invalid. Must be one of {constants.VALID_PLUGIN_ACTIONS}."); final_is_valid = False
+    return final_is_valid, errors
 def validate_plugin_action_task_specific(task_dict: Dict, source_info: str) -> Tuple[bool, List[str]]:
     context_name = f"Plugin Action Task from {source_info}"
     logger.debug(f"Validating {context_name}...")
