@@ -880,3 +880,277 @@ def configure_network_adapter_dns(self, preferred_dns: str, alternate_dns: Optio
             self.logger.info("Plugin update request submitted successfully.")
             return True 
         except OmeApiError as e: self.logger.error(f"API error updating console plugins: {str(e)}"); return False
+#-------
+    def get_appliance_information(self) -> Optional[Dict]:
+        endpoint = constants.API_ENDPOINTS.get('appliance_information', '/api/ApplicationService/application')
+        self.logger.info(f"Fetching appliance information from {endpoint}...")
+        try:
+            response_data = self._send_api_request('GET', endpoint)
+            if isinstance(response_data, dict):
+                self.logger.debug(f"Successfully fetched appliance information.")
+                return response_data
+            self.logger.warning(f"Unexpected response format when fetching appliance information: {type(response_data)}"); return None
+        except OmeApiError as e: self.logger.error(f"API error fetching appliance information: {str(e)}"); return None
+        except Exception as e: self.logger.error(f"Unexpected error fetching appliance information: {e}", exc_info=True); return None
+#-----
+ def get_plugin_details(self, plugin_id: Optional[str] = None, plugin_name: Optional[str] = None) -> Optional[List[Dict]]:
+        endpoint = constants.API_ENDPOINTS.get('get_plugins', '/api/PluginService/Plugins')
+        params = {}
+        log_msg = "Fetching all plugin details"
+        if plugin_id: params['$filter'] = f"Id eq '{plugin_id}'"; log_msg = f"Fetching plugin details for ID '{plugin_id}'"
+        elif plugin_name: params['$filter'] = f"Name eq '{plugin_name}'"; log_msg = f"Fetching plugin details for Name '{plugin_name}'"
+        self.logger.info(log_msg + "...")
+        try:
+            response_data = self._send_api_request('GET', endpoint, params=params if params else None)
+            if response_data and isinstance(response_data, dict) and 'value' in response_data and isinstance(response_data['value'], list):
+                self.logger.debug(f"Found {len(response_data['value'])} plugins matching query.")
+                return response_data['value']
+            elif response_data and isinstance(response_data, list): 
+                self.logger.debug(f"Found {len(response_data)} plugins matching query (direct list).")
+                return response_data
+            self.logger.warning(f"No plugins found or unexpected response format for plugin details. Response: {response_data}")
+            return [] 
+        except OmeApiError as e: self.logger.error(f"API error fetching plugin details: {str(e)}"); return None
+        except Exception as e: self.logger.error(f"Unexpected error fetching plugin details: {e}", exc_info=True); return None
+
+    def get_plugin_available_versions(self, plugin_id: str) -> Optional[List[Dict]]:
+        endpoint_template = constants.API_ENDPOINTS.get('get_plugin_available_versions')
+        if not endpoint_template: self.logger.error("EP 'get_plugin_available_versions' not in constants."); return None
+        endpoint_path = endpoint_template.format(plugin_id=plugin_id) 
+        self.logger.info(f"Fetching available versions for plugin ID '{plugin_id}' from {endpoint_path}...")
+        try:
+            response_data = self._send_api_request('GET', endpoint_path)
+            if response_data and isinstance(response_data, dict) and "value" in response_data and isinstance(response_data["value"], list):
+                versions = response_data["value"]
+                self.logger.info(f"Found {len(versions)} available versions for plugin {plugin_id}.")
+                self.logger.debug(f"Available versions details: {versions}")
+                return versions 
+            self.logger.warning(f"No available versions or unexpected format for plugin {plugin_id}. Response: {response_data}"); return []
+        except OmeApiError as e: self.logger.error(f"API error fetching available versions for plugin {plugin_id}: {str(e)}"); return None
+        except Exception as e: self.logger.error(f"Unexpected error fetching available versions for plugin {plugin_id}: {e}", exc_info=True); return None
+        
+        #-------
+        
+        def update_console_plugins(self, plugin_action_list: List[Dict]) -> Tuple[bool, Optional[str]]: # Return (success, job_id)
+        """
+        Performs actions (Install, Uninstall, Enable, Disable) on console plugins.
+        Payload: {"Plugins": [{"Id": "GUID", "Version": "1.0.0", "Action": "Install", "AcceptAllLicenseAgreements": true}, ...]}
+        Returns a tuple: (True if action submission was successful, Optional Job ID string if async)
+        """
+        endpoint = constants.API_ENDPOINTS.get('update_plugins_action', "/api/PluginService/Actions/PluginService.UpdateConsolePlugins")
+        
+        # Construct the final payload with the "Plugins" wrapper
+        final_payload = {"Plugins": plugin_action_list}
+        
+        self.logger.info(f"Submitting plugin actions: {json.dumps(final_payload, indent=2)[:500]}...")
+        try:
+            # This action might be synchronous or return a job ID (e.g., HTTP 202)
+            response_data = self._send_api_request('POST', endpoint, json_data=final_payload)
+            
+            if response_data and isinstance(response_data, dict) and response_data.get('Id') is not None and response_data.get('JobType', {}).get('Name') == 'PluginInstallJob': # Example check for job
+                job_id = str(response_data['Id'])
+                self.logger.info(f"Plugin action job submitted successfully. Job ID: {job_id}")
+                return True, job_id
+            elif response_data is None: # e.g. 204 No Content for a synchronous success for simple actions like Enable/Disable
+                self.logger.info("Plugin action request completed successfully (synchronous or no job ID returned).")
+                return True, None
+            else: # Some other 2xx response that isn't a clear job or simple success
+                self.logger.warning(f"Plugin action request returned unexpected response: {response_data}. Assuming submission was accepted.")
+                return True, None # Or False, None depending on how strict we need to be
+        except OmeApiError as e:
+            self.logger.error(f"API error updating console plugins: {str(e)}")
+            return False, None
+        except Exception as e:
+            self.logger.error(f"Unexpected error updating console plugins: {e}", exc_info=True)
+            return False, None
+#----------------------
+# --- Catalog Management Methods ---
+    def get_catalogs(self, catalog_name: Optional[str] = None, catalog_id_filter: Optional[int] = None) -> Optional[List[Dict]]:
+        """Retrieves all catalogs or a specific catalog by name or ID."""
+        endpoint = constants.API_ENDPOINTS.get('catalogs', '/api/UpdateService/Catalogs')
+        params = {}
+        log_msg = "Fetching all catalogs"
+        if catalog_name:
+            escaped_name = catalog_name.replace("'", "''")
+            params['$filter'] = f"Name eq '{escaped_name}' or Repository/Name eq '{escaped_name}'"
+            params['$top'] = '10' 
+            log_msg = f"Fetching catalog(s) with name matching '{catalog_name}'"
+        elif catalog_id_filter is not None:
+            endpoint_by_id_template = constants.API_ENDPOINTS.get('catalog_by_id')
+            if endpoint_by_id_template: endpoint = endpoint_by_id_template.format(catalog_id=catalog_id_filter)
+            else: params['$filter'] = f"Id eq {catalog_id_filter}"
+            log_msg = f"Fetching catalog with ID '{catalog_id_filter}'"
+        
+        self.logger.info(log_msg + "...")
+        try:
+            response = self._send_api_request('GET', endpoint, params=params if params else None)
+            if response and isinstance(response, dict) and 'value' in response and isinstance(response['value'], list): return response['value']
+            elif response and isinstance(response, list): return response
+            elif response and isinstance(response, dict) and catalog_id_filter is not None: return [response] 
+            self.logger.warning(f"No catalogs found or unexpected response. Response: {response}"); return []
+        except OmeApiError as e: self.logger.error(f"API error fetching catalogs: {str(e)}"); return None
+
+    def create_catalog(self, catalog_payload: Dict) -> Optional[Dict]: 
+        """Creates a new catalog in OME. Payload includes Repository details."""
+        endpoint = constants.API_ENDPOINTS.get('catalogs', '/api/UpdateService/Catalogs')
+        catalog_name_for_log = catalog_payload.get("Repository", {}).get("Name", catalog_payload.get("Filename", "UnknownCatalog"))
+        self.logger.info(f"Creating catalog '{catalog_name_for_log}'...")
+        try:
+            response = self._send_api_request('POST', endpoint, json_data=catalog_payload)
+            if response and isinstance(response, dict) and response.get('Id') is not None:
+                self.logger.info(f"Catalog creation request for '{catalog_name_for_log}' submitted. Catalog ID: {response.get('Id')}, Task ID: {response.get('TaskId')}")
+                return response 
+            self.logger.error(f"Failed to create catalog '{catalog_name_for_log}' or response missing ID/TaskId. Response: {response}"); return None
+        except OmeApiError as e: self.logger.error(f"API error creating catalog '{catalog_name_for_log}': {str(e)}"); return None
+
+    def refresh_catalog(self, catalog_id: int) -> Optional[Dict]: 
+        """Initiates a refresh for a specific catalog. Returns job/task info."""
+        endpoint = constants.API_ENDPOINTS.get('refresh_catalogs_action', '/api/UpdateService/Actions/UpdateService.RefreshCatalogs')
+        payload = {"CatalogIds": [catalog_id], "AllCatalogs": False} 
+        self.logger.info(f"Initiating refresh for catalog ID: {catalog_id}...")
+        try:
+            response = self._send_api_request('POST', endpoint, json_data=payload)
+            if response and isinstance(response, dict): 
+                self.logger.info(f"Catalog refresh job for ID {catalog_id} submitted. Response: {response}")
+                return response 
+            elif response is None: 
+                self.logger.info(f"Catalog refresh for ID {catalog_id} accepted (204 No Content).")
+                return {"status": "accepted_no_content", "TaskId": None} 
+            self.logger.error(f"Failed to initiate refresh for catalog ID {catalog_id}. Response: {response}"); return None
+        except OmeApiError as e: self.logger.error(f"API error refreshing catalog ID {catalog_id}: {str(e)}"); return None
+
+    # --- Baseline Management Methods ---
+    def get_baselines(self, baseline_name: Optional[str] = None, baseline_id_filter: Optional[int] = None) -> Optional[List[Dict]]:
+        """Retrieves all baselines or a specific baseline by name or ID."""
+        endpoint = constants.API_ENDPOINTS.get('baselines', '/api/UpdateService/Baselines')
+        params = {}
+        log_msg = "Fetching all baselines"
+        if baseline_name:
+            escaped_name = baseline_name.replace("'", "''")
+            params['$filter'] = f"Name eq '{escaped_name}'"; params['$top'] = '1' 
+            log_msg = f"Fetching baseline with name '{baseline_name}'"
+        elif baseline_id_filter is not None:
+            endpoint_by_id_template = constants.API_ENDPOINTS.get('baseline_by_id')
+            if endpoint_by_id_template: endpoint = endpoint_by_id_template.format(baseline_id=baseline_id_filter)
+            else: params['$filter'] = f"Id eq {baseline_id_filter}"
+            log_msg = f"Fetching baseline with ID '{baseline_id_filter}'"
+        self.logger.info(log_msg + "...")
+        try:
+            response = self._send_api_request('GET', endpoint, params=params if params else None)
+            if response and isinstance(response, dict) and 'value' in response and isinstance(response['value'], list): return response['value']
+            elif response and isinstance(response, list): return response
+            elif response and isinstance(response, dict) and baseline_id_filter is not None: return [response]
+            self.logger.warning(f"No baselines found or unexpected response. Response: {response}"); return []
+        except OmeApiError as e: self.logger.error(f"API error fetching baselines: {str(e)}"); return None
+
+    def create_baseline(self, baseline_payload: Dict) -> Optional[Dict]: 
+        """Creates a new firmware baseline. Returns baseline object with TaskId."""
+        endpoint = constants.API_ENDPOINTS.get('baselines', '/api/UpdateService/Baselines')
+        baseline_name_for_log = baseline_payload.get("Name", "UnknownBaseline")
+        self.logger.info(f"Creating baseline '{baseline_name_for_log}'...")
+        try:
+            response = self._send_api_request('POST', endpoint, json_data=baseline_payload)
+            if response and isinstance(response, dict) and response.get('Id') is not None and response.get('TaskId') is not None:
+                self.logger.info(f"Baseline creation request for '{baseline_name_for_log}' submitted. ID: {response.get('Id')}, TaskID (Compliance Job): {response.get('TaskId')}")
+                return response 
+            self.logger.error(f"Failed to create baseline '{baseline_name_for_log}' or response missing ID/TaskId. Response: {response}"); return None
+        except OmeApiError as e: self.logger.error(f"API error creating baseline '{baseline_name_for_log}': {str(e)}"); return None
+
+    def get_baseline_compliance_report(self, baseline_id: int) -> Optional[List[Dict]]:
+        """Retrieves the device compliance report for a given baseline."""
+        endpoint_template = constants.API_ENDPOINTS.get('baseline_device_compliance_reports')
+        if not endpoint_template: self.logger.error("EP 'baseline_device_compliance_reports' missing."); return None
+        endpoint = endpoint_template.format(baseline_id=baseline_id)
+        self.logger.info(f"Fetching compliance report for baseline ID: {baseline_id}...")
+        try:
+            response = self._send_api_request('GET', endpoint)
+            if response and isinstance(response, dict) and 'value' in response and isinstance(response['value'], list): return response['value']
+            elif response and isinstance(response, list): return response
+            self.logger.warning(f"No compliance report data or unexpected format for baseline {baseline_id}. Response: {response}"); return []
+        except OmeApiError as e: self.logger.error(f"API error fetching compliance report for baseline {baseline_id}: {str(e)}"); return None
+
+    # --- Firmware Update Methods ---
+    def get_job_type_id_by_name(self, job_type_name: str) -> Optional[int]:
+        """Finds the ID of a job type (e.g., 'Update_Task')."""
+        endpoint = constants.API_ENDPOINTS.get('job_types', '/api/JobService/JobTypes')
+        self.logger.debug(f"Fetching job types to find ID for '{job_type_name}'...")
+        try:
+            response = self._send_api_request('GET', endpoint)
+            job_types: List[Dict] = []
+            if response and isinstance(response, dict) and 'value' in response and isinstance(response['value'], list): job_types = response['value']
+            elif response and isinstance(response, list): job_types = response
+            else: self.logger.warning(f"Could not retrieve job types. Response: {response}"); return None
+            for jt in job_types:
+                if jt.get('Name') == job_type_name and jt.get('Id') is not None: return int(jt['Id'])
+            self.logger.warning(f"Job type '{job_type_name}' not found."); return None
+        except OmeApiError as e: self.logger.error(f"API error fetching job types: {str(e)}"); return None
+        except (ValueError, TypeError) as e: self.logger.error(f"Error parsing job type ID: {e}"); return None
+
+    def create_firmware_update_job(self, firmware_update_payload: Dict) -> Optional[Dict]: 
+        """Creates and initiates a firmware update job. Returns the created job object."""
+        endpoint = constants.API_ENDPOINTS.get('jobs_service_jobs', '/api/JobService/Jobs') 
+        job_name = firmware_update_payload.get("JobName", "FirmwareUpdateJob")
+        self.logger.info(f"Creating firmware update job: '{job_name}'...")
+        try:
+            response = self._send_api_request('POST', endpoint, json_data=firmware_update_payload)
+            if response and isinstance(response, dict) and response.get('Id') is not None:
+                self.logger.info(f"Firmware update job '{job_name}' created successfully. Job ID: {response.get('Id')}")
+                return response 
+            self.logger.error(f"Failed to create firmware update job '{job_name}' or response missing ID. Response: {response}"); return None
+        except OmeApiError as e: self.logger.error(f"API error creating firmware update job '{job_name}': {str(e)}"); return None
+
+    def rerun_job(self, job_id: int) -> Optional[Dict]: 
+        """Reruns an existing job, e.g., a baseline compliance job."""
+        endpoint = constants.API_ENDPOINTS.get('run_jobs_action', '/api/JobService/Actions/JobService.RunJobs')
+        payload = {"JobIds": [job_id]}
+        self.logger.info(f"Requesting rerun of job ID: {job_id}...")
+        try:
+            response = self._send_api_request('POST', endpoint, json_data=payload)
+            if response is None: 
+                self.logger.info(f"Rerun request for job ID {job_id} accepted (204)."); return {"status": "rerun_accepted_no_content", "original_job_id": job_id}
+            elif isinstance(response, dict):
+                self.logger.info(f"Rerun request for job ID {job_id} processed. Response: {response}"); return response 
+            self.logger.warning(f"Unexpected response from rerun job {job_id}: {response}"); return None
+        except OmeApiError as e: self.logger.error(f"API error rerunning job ID {job_id}: {str(e)}"); return None
+            
+    def get_device_type_details(self) -> Optional[List[Dict]]:
+        """Retrieves device type information (ID to Name mapping)."""
+        endpoint = constants.API_ENDPOINTS.get('device_types', '/api/DeviceService/DeviceType')
+        self.logger.debug("Fetching device type details...")
+        try:
+            response = self._send_api_request('GET', endpoint)
+            if response and isinstance(response, dict) and 'value' in response and isinstance(response['value'], list): return response['value']
+            elif response and isinstance(response, list): return response
+            self.logger.warning(f"Could not retrieve device types. Response: {response}"); return None
+        except OmeApiError as e: self.logger.error(f"API error fetching device types: {str(e)}"); return None
+
+    def get_devices_by_filter(self, odata_filter: str) -> Optional[List[Dict]]:
+        """Retrieves devices matching an OData filter."""
+        endpoint = constants.API_ENDPOINTS.get('devices', '/api/DeviceService/Devices')
+        self.logger.debug(f"Fetching devices with filter: {odata_filter}")
+        try:
+            response = self._send_api_request('GET', endpoint, params={'$filter': odata_filter})
+            if response and isinstance(response, dict) and 'value' in response and isinstance(response['value'], list): return response['value']
+            elif response and isinstance(response, list): return response 
+            self.logger.warning(f"No devices found for filter or unexpected response: {response}"); return []
+        except OmeApiError as e: self.logger.error(f"API error fetching devices with filter '{odata_filter}': {str(e)}"); return None
+
+    def get_devices_by_ids(self, device_ids: List[int]) -> Optional[List[Dict]]:
+        """Retrieves specific devices by their OME IDs."""
+        if not device_ids: return []
+        id_filters = [f"Id eq {dev_id}" for dev_id in device_ids]
+        odata_filter = " or ".join(id_filters)
+        self.logger.debug(f"Fetching devices by IDs: {device_ids}")
+        return self.get_devices_by_filter(odata_filter)
+
+    def get_devices_by_group_id(self, group_id: int) -> Optional[List[Dict]]:
+        """Retrieves devices belonging to a specific group ID."""
+        endpoint_template = constants.API_ENDPOINTS.get('group_devices', '/api/GroupService/Groups({group_id})/Devices')
+        endpoint = endpoint_template.format(group_id=group_id)
+        self.logger.debug(f"Fetching devices for group ID: {group_id}")
+        try:
+            response = self._send_api_request('GET', endpoint)
+            if response and isinstance(response, dict) and 'value' in response and isinstance(response['value'], list): return response['value']
+            elif response and isinstance(response, list): return response
+            self.logger.warning(f"No devices found for group {group_id} or unexpected response: {response}"); return []
+        except OmeApiError as e: self.logger.error(f"API error fetching devices for group {group_id}: {str(e)}"); return None
